@@ -13,11 +13,13 @@ import kotlinx.coroutines.flow.StateFlow
 interface DeviceTransport {
     val transportType: TransportType
     val state: StateFlow<TransportState>
+    val discoveredPeers: StateFlow<List<PeerDevice>>
     val connectedPeers: StateFlow<List<PeerDevice>>
     val incomingPayloads: Flow<Payload>
 
     suspend fun start()
     suspend fun stop()
+    suspend fun connect(peerId: String): Result<Unit>
     suspend fun send(payload: Payload, targetPeerId: String? = null): Result<Unit>
     fun isAvailable(): Boolean
 }

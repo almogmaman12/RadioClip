@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="cache_files" path="." />
+    <cache-path name="received_files" path="received_files/" />
+    <files-path name="internal_files" path="." />
+</paths>

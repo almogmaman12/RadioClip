@@ -29,7 +29,7 @@ import com.almog.radioclip.ui.theme.RadioClipTheme
 
 class MainActivity : ComponentActivity() {
 
-    private var syncService: RadioSyncService? by mutableStateOf(null)
+    private var syncService: RadioSyncService? by mutableStateOf(RadioSyncService.activeInstance)
     private var isBound by mutableStateOf(false)
 
     private val serviceConnection = object : ServiceConnection {
@@ -40,14 +40,28 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
-            syncService = null
+            syncService = RadioSyncService.activeInstance
             isBound = false
+        }
+    }
+
+    private var triggerFilePicker by mutableStateOf(false)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
+            triggerFilePicker = true
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        if (intent?.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
+            triggerFilePicker = true
+        }
 
         setContent {
             RadioClipTheme {
@@ -57,6 +71,31 @@ class MainActivity : ComponentActivity() {
                     val allGranted = permissions.values.all { it }
                     if (allGranted) {
                         startAndBindService()
+                    }
+                }
+
+                // File picker launcher that can be triggered from UI or from notification action
+                val filePickerLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.GetContent()
+                ) { uri: android.net.Uri? ->
+                    triggerFilePicker = false
+                    uri?.let {
+                        val (name, size) = queryFileMeta(this, it)
+                        val mime = contentResolver.getType(it) ?: "application/octet-stream"
+                        syncService?.sendPayload(
+                            Payload.File(
+                                fileName = name,
+                                mimeType = mime,
+                                sizeBytes = size,
+                                uriString = it.toString()
+                            )
+                        )
+                    }
+                }
+
+                androidx.compose.runtime.LaunchedEffect(triggerFilePicker) {
+                    if (triggerFilePicker) {
+                        filePickerLauncher.launch("*/*")
                     }
                 }
 
@@ -82,12 +121,23 @@ class MainActivity : ComponentActivity() {
                     ?: TransportState.IDLE
                 val wifiState = currentService?.wifiEngine?.state?.collectAsState()?.value
                     ?: TransportState.IDLE
+                val discoveredBlePeers = currentService?.bleEngine?.discoveredPeers?.collectAsState()?.value ?: emptyList()
+                val discoveredWifiPeers = currentService?.wifiEngine?.discoveredPeers?.collectAsState()?.value ?: emptyList()
+                val connectedBlePeers = currentService?.bleEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
+                val connectedWifiPeers = currentService?.wifiEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
                 val history = currentService?.history?.collectAsState()?.value ?: emptyList()
 
                 DashboardScreen(
                     bleState = bleState,
                     wifiState = wifiState,
+                    discoveredBlePeers = discoveredBlePeers,
+                    discoveredWifiPeers = discoveredWifiPeers,
+                    connectedBlePeers = connectedBlePeers,
+                    connectedWifiPeers = connectedWifiPeers,
                     history = history,
+                    onConnectPeer = { transportType, peerId ->
+                        currentService?.connectToPeer(transportType, peerId)
+                    },
                     onSendText = { text ->
                         currentService?.sendPayload(Payload.Text(content = text))
                     },
@@ -111,6 +161,20 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    private fun queryFileMeta(context: Context, uri: android.net.Uri): Pair<String, Long> {
+        var name = "unknown_file"
+        var size = 0L
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+            if (cursor.moveToFirst()) {
+                if (nameIndex != -1) name = cursor.getString(nameIndex) ?: name
+                if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
+            }
+        }
+        return Pair(name, size)
     }
 
     private fun startAndBindService() {

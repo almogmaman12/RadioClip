@@ -65,8 +65,14 @@ class SyncRouter(
         return when (payload) {
             is Payload.Text -> {
                 if (payload.byteSize <= BLE_MAX_PAYLOAD_BYTES && isBleReady()) {
-                    bleEngine.send(payload, targetPeerId)
-                        .map { TransportType.BLE_GATT }
+                    val bleResult = bleEngine.send(payload, targetPeerId)
+                    if (bleResult.isSuccess) {
+                        Result.success(TransportType.BLE_GATT)
+                    } else {
+                        // Fallback to Wi-Fi Direct socket if BLE fails
+                        wifiEngine.send(payload, targetPeerId)
+                            .map { TransportType.WIFI_DIRECT_SOCKET }
+                    }
                 } else {
                     wifiEngine.send(payload, targetPeerId)
                         .map { TransportType.WIFI_DIRECT_SOCKET }
@@ -80,7 +86,10 @@ class SyncRouter(
     }
 
     private fun isBleReady(): Boolean {
+        val state = bleEngine.state.value
         return bleEngine.isAvailable() &&
-                (bleEngine.state.value == TransportState.CONNECTED || bleEngine.connectedPeers.value.isNotEmpty())
+                state != TransportState.ERROR &&
+                state != TransportState.DISCONNECTED &&
+                (state == TransportState.CONNECTED || bleEngine.connectedPeers.value.isNotEmpty())
     }
 }

@@ -5,7 +5,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,12 +22,15 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.res.painterResource
+import com.almog.radioclip.R
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -49,7 +52,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.almog.radioclip.model.Payload
+import com.almog.radioclip.model.PeerDevice
 import com.almog.radioclip.model.TransportState
+import com.almog.radioclip.model.TransportType
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -59,7 +64,12 @@ import java.util.Locale
 fun DashboardScreen(
     bleState: TransportState,
     wifiState: TransportState,
+    discoveredBlePeers: List<PeerDevice>,
+    discoveredWifiPeers: List<PeerDevice>,
+    connectedBlePeers: List<PeerDevice>,
+    connectedWifiPeers: List<PeerDevice>,
     history: List<Payload>,
+    onConnectPeer: (transportType: TransportType, peerId: String) -> Unit,
     onSendText: (String) -> Unit,
     onSendFile: (name: String, mimeType: String, sizeBytes: Long, uriString: String) -> Unit,
     onRequestPermissions: () -> Unit
@@ -81,13 +91,38 @@ fun DashboardScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
-                        Text("RadioClip", fontWeight = FontWeight.Bold)
-                        Text(
-                            "Offline P2P Clipboard & File Sync",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Image(
+                            painter = painterResource(id = R.drawable.app_logo),
+                            contentDescription = "RadioClip Logo",
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(RoundedCornerShape(8.dp))
                         )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("RadioClip", fontWeight = FontWeight.Bold)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Surface(
+                                    color = MaterialTheme.colorScheme.tertiaryContainer,
+                                    shape = RoundedCornerShape(4.dp)
+                                ) {
+                                    Text(
+                                        text = "BETA",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                            Text(
+                                "Offline P2P Clipboard & File Sync",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -98,13 +133,13 @@ fun DashboardScreen(
                         onClick = onRequestPermissions,
                         modifier = Modifier.padding(end = 8.dp)
                     ) {
-                        Text("Check Perms")
+                        Text("Perms")
                     }
                 }
             )
         }
     ) { innerPadding ->
-        Column(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
@@ -112,108 +147,244 @@ fun DashboardScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             // Transport Status Cards
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                StatusCard(
-                    modifier = Modifier.weight(1f),
-                    title = "BLE GATT",
-                    subtitle = "Text <= 20 KB",
-                    state = bleState
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    StatusCard(
+                        modifier = Modifier.weight(1f),
+                        title = "BLE GATT",
+                        subtitle = "Text <= 20 KB",
+                        state = bleState,
+                        connectedCount = connectedBlePeers.size
+                    )
+                    StatusCard(
+                        modifier = Modifier.weight(1f),
+                        title = "Wi-Fi Direct",
+                        subtitle = "Files & Large Payloads",
+                        state = wifiState,
+                        connectedCount = connectedWifiPeers.size
+                    )
+                }
+            }
+
+            // Bluetooth Peers Section
+            item {
+                PeerSectionCard(
+                    title = "Bluetooth Peers (BLE)",
+                    peers = discoveredBlePeers,
+                    connectedPeers = connectedBlePeers,
+                    emptyText = "Scanning for nearby RadioClip BLE devices...",
+                    transportType = TransportType.BLE_GATT,
+                    onConnect = { onConnectPeer(TransportType.BLE_GATT, it) }
                 )
-                StatusCard(
-                    modifier = Modifier.weight(1f),
-                    title = "Wi-Fi Direct",
-                    subtitle = "Files & Large Payloads",
-                    state = wifiState
+            }
+
+            // Wi-Fi Direct Peers Section
+            item {
+                // Once a P2P group forms, Android stops returning connected devices in scan
+                // results. Merge connectedWifiPeers into the displayed list so CONNECTED peers
+                // stay visible even after discovery clears them from discoveredWifiPeers.
+                val allWifiPeers = buildList {
+                    addAll(discoveredWifiPeers)
+                    connectedWifiPeers.forEach { connected ->
+                        if (discoveredWifiPeers.none { it.id == connected.id }) {
+                            add(connected)
+                        }
+                    }
+                }
+                PeerSectionCard(
+                    title = "Wi-Fi Direct Peers",
+                    peers = allWifiPeers,
+                    connectedPeers = connectedWifiPeers,
+                    emptyText = "Searching for nearby Android Wi-Fi Direct devices...",
+                    transportType = TransportType.WIFI_DIRECT_SOCKET,
+                    onConnect = { onConnectPeer(TransportType.WIFI_DIRECT_SOCKET, it) }
                 )
             }
 
             // Quick Send Clipboard Text Card
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
-                ),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        "Broadcast Clipboard / Text",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = textInput,
-                        onValueChange = { textInput = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("Paste clipboard text or type message...") },
-                        maxLines = 4
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                    ),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
                         Text(
-                            text = "${textInput.toByteArray(Charsets.UTF_8).size} bytes",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            "Broadcast Clipboard / Text",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilledTonalButton(
-                                onClick = { filePickerLauncher.launch("*/*") }
-                            ) {
-                                Text("Pick File")
-                            }
-                            Button(
-                                onClick = {
-                                    if (textInput.isNotBlank()) {
-                                        onSendText(textInput)
-                                        textInput = ""
-                                    }
-                                },
-                                enabled = textInput.isNotBlank()
-                            ) {
-                                Text("Send")
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = textInput,
+                            onValueChange = { textInput = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            placeholder = { Text("Paste clipboard text or type message...") },
+                            maxLines = 4
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "${textInput.toByteArray(Charsets.UTF_8).size} bytes",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilledTonalButton(
+                                    onClick = { filePickerLauncher.launch("*/*") }
+                                ) {
+                                    Text("Pick File")
+                                }
+                                Button(
+                                    onClick = {
+                                        if (textInput.isNotBlank()) {
+                                            onSendText(textInput)
+                                            textInput = ""
+                                        }
+                                    },
+                                    enabled = textInput.isNotBlank()
+                                ) {
+                                    Text("Send")
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // Recent Transferred Payloads
-            Text(
-                "Activity History (${history.size})",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold
-            )
+            // Activity History Title
+            item {
+                Text(
+                    "Activity History (${history.size})",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
 
             if (history.isEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        "No synced items yet.\nConnected peers will appear automatically.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.outline
-                    )
+                item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(100.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            "No synced items yet.\nCopied text or sent files will appear here automatically.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
                 }
             } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(history, key = { it.id }) { payload ->
-                        PayloadItem(payload = payload)
+                items(history, key = { it.id }) { payload ->
+                    PayloadItem(payload = payload)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PeerSectionCard(
+    title: String,
+    peers: List<PeerDevice>,
+    connectedPeers: List<PeerDevice>,
+    emptyText: String,
+    transportType: TransportType,
+    onConnect: (String) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "${peers.size} found",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            if (peers.isEmpty()) {
+                Text(
+                    emptyText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    peers.forEach { peer ->
+                        val isConnected = connectedPeers.any { it.id == peer.id }
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(
+                                    MaterialTheme.colorScheme.surfaceContainerLow,
+                                    RoundedCornerShape(8.dp)
+                                )
+                                .padding(10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = peer.name,
+                                    fontWeight = FontWeight.Medium,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(
+                                    text = peer.id,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            if (isConnected) {
+                                Surface(
+                                    color = Color(0xFF2E7D32).copy(alpha = 0.15f),
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        "CONNECTED",
+                                        color = Color(0xFF2E7D32),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            } else {
+                                OutlinedButton(
+                                    onClick = { onConnect(peer.id) },
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text("Connect", fontSize = 12.sp)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -226,7 +397,8 @@ fun StatusCard(
     modifier: Modifier = Modifier,
     title: String,
     subtitle: String,
-    state: TransportState
+    state: TransportState,
+    connectedCount: Int = 0
 ) {
     val statusColor = when (state) {
         TransportState.CONNECTED -> Color(0xFF2E7D32)
@@ -260,17 +432,31 @@ fun StatusCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(modifier = Modifier.height(6.dp))
-            Surface(
-                color = statusColor.copy(alpha = 0.12f),
-                shape = RoundedCornerShape(6.dp)
+            Row(
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Text(
-                    text = state.name,
-                    color = statusColor,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                )
+                Surface(
+                    color = statusColor.copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text(
+                        text = state.name,
+                        color = statusColor,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+                if (connectedCount > 0) {
+                    Text(
+                        text = "$connectedCount peer(s)",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF2E7D32)
+                    )
+                }
             }
         }
     }
@@ -282,6 +468,10 @@ fun PayloadItem(payload: Payload) {
         SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(payload.timestamp))
     }
 
+    val badgeColor = if (payload.transportType == TransportType.BLE_GATT) Color(0xFF1565C0) else Color(0xFF6A1B9A)
+    val badgeText = if (payload.transportType == TransportType.BLE_GATT) "BLE GATT" else "WI-FI DIRECT"
+    val context = LocalContext.current
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -290,21 +480,67 @@ fun PayloadItem(payload: Payload) {
         Column(modifier = Modifier.padding(12.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = if (payload is Payload.Text) "CLIPBOARD TEXT" else "FILE",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary
-                )
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Surface(
+                        color = badgeColor.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = badgeText,
+                            color = badgeColor,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+
+                    // Direction badge (Sent vs Received)
+                    val dirColor = if (payload.isOutgoing) Color(0xFF2E7D32) else Color(0xFFE65100)
+                    Surface(
+                        color = dirColor.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = if (payload.isOutgoing) "SENT" else "RECEIVED",
+                            color = dirColor,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+
+                    Text(
+                        text = if (payload is Payload.Text) "CLIPBOARD" else "FILE",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
                 Text(
                     text = timeFormatted,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            Spacer(modifier = Modifier.height(4.dp))
+
+            // Sender / Device details
+            val deviceLabel = when {
+                payload.isOutgoing -> "From: This Device"
+                payload.senderDeviceName != null -> "From: ${payload.senderDeviceName}"
+                else -> "From: Nearby Peer"
+            }
+            Text(
+                text = deviceLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
             when (payload) {
                 is Payload.Text -> {
                     Text(
@@ -314,19 +550,69 @@ fun PayloadItem(payload: Payload) {
                     )
                 }
                 is Payload.File -> {
-                    Text(
-                        text = payload.fileName,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Medium
-                    )
-                    Text(
-                        text = "${payload.mimeType} • ${(payload.sizeBytes / 1024.0).toInt()} KB",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = payload.fileName,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "${payload.mimeType} • ${(payload.sizeBytes / 1024.0).toInt()} KB",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        // Open File action button
+                        FilledTonalButton(
+                            onClick = {
+                                openFileIntent(context, payload)
+                            },
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("Open")
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+private fun openFileIntent(context: Context, filePayload: Payload.File) {
+    try {
+        val targetUri = when {
+            filePayload.localPath != null -> {
+                val file = java.io.File(filePayload.localPath)
+                if (file.exists()) {
+                    androidx.core.content.FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.fileprovider",
+                        file
+                    )
+                } else null
+            }
+            filePayload.uriString != null -> Uri.parse(filePayload.uriString)
+            else -> null
+        }
+
+        if (targetUri != null) {
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(targetUri, filePayload.mimeType.ifBlank { "*/*" })
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(android.content.Intent.createChooser(intent, "Open with...").apply {
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+        }
+    } catch (e: Exception) {
+        android.widget.Toast.makeText(context, "Could not open file: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
     }
 }
 
