@@ -14,27 +14,35 @@ import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
+import com.almog.radioclip.core.FileNames
+import com.almog.radioclip.core.SecureInputStream
+import com.almog.radioclip.core.SecureOutputStream
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.PeerDevice
 import com.almog.radioclip.model.TransportState
 import com.almog.radioclip.model.TransportType
 import com.almog.radioclip.transport.DeviceTransport
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.EOFException
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -46,17 +54,26 @@ import kotlin.coroutines.suspendCoroutine
 @SuppressLint("MissingPermission")
 class WifiEngine(
     private val context: Context,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job())
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job()),
+    private val keyProvider: () -> ByteArray? = { null }
 ) : DeviceTransport {
 
     companion object {
         private const val TAG = "WifiEngine"
         const val PORT = 8888
-        private const val SOCKET_TIMEOUT_MS = 10000
+        private const val CONNECT_TIMEOUT_MS = 10_000
+        private const val IO_TIMEOUT_MS = 30_000
+        private const val MAX_CONCURRENT_CONNECTIONS = 6
+
+        const val MAX_FILE_BYTES = 1L shl 30        // 1 GiB
+        const val MAX_TEXT_BYTES = 1 shl 20         // 1 MiB
+        private const val MIN_FREE_SPACE_BYTES = 50L * 1024 * 1024
+        private const val MAX_MIME_LENGTH = 255
 
         // Stream wire protocol tags
         private const val TYPE_TEXT: Byte = 1
         private const val TYPE_FILE: Byte = 2
+        private const val TYPE_HELLO: Byte = 3
     }
 
     override val transportType: TransportType = TransportType.WIFI_DIRECT_SOCKET
@@ -80,6 +97,11 @@ class WifiEngine(
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
     private var isReceiverRegistered = false
+
+    @Volatile
+    private var started = false
+
+    private val connectionLimiter = Semaphore(MAX_CONCURRENT_CONNECTIONS)
 
     @Volatile
     var groupOwnerAddress: String? = null
@@ -154,10 +176,12 @@ class WifiEngine(
     }
 
     override suspend fun start() = withContext(Dispatchers.IO) {
+        if (started) return@withContext
         if (!isAvailable()) {
             _state.value = TransportState.ERROR
             return@withContext
         }
+        started = true
 
         channel = wifiP2pManager?.initialize(context, context.mainLooper, null)
 
@@ -169,7 +193,9 @@ class WifiEngine(
         }
 
         if (!isReceiverRegistered) {
-            context.registerReceiver(p2pReceiver, intentFilter)
+            ContextCompat.registerReceiver(
+                context, p2pReceiver, intentFilter, ContextCompat.RECEIVER_NOT_EXPORTED
+            )
             isReceiverRegistered = true
         }
 
@@ -225,6 +251,7 @@ class WifiEngine(
     }
 
     override suspend fun stop() = withContext(Dispatchers.IO) {
+        started = false
         connectionMonitorJob?.cancel()
         connectionMonitorJob = null
 
@@ -238,7 +265,11 @@ class WifiEngine(
         }
 
         serverJob?.cancel()
-        serverSocket?.close()
+        try {
+            serverSocket?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed closing server socket", e)
+        }
         serverSocket = null
 
         val p2p = wifiP2pManager
@@ -246,12 +277,21 @@ class WifiEngine(
         if (p2p != null && ch != null) {
             p2p.stopPeerDiscovery(ch, null)
             p2p.removeGroup(ch, null)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                try {
+                    ch.close()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed closing p2p channel", e)
+                }
+            }
         }
+        channel = null
 
         _discoveredPeers.value = emptyList()
         _connectedPeers.value = emptyList()
         connectedClientIps.clear()
         groupOwnerAddress = null
+        pendingConnectMac = null
         _state.value = TransportState.IDLE
     }
 
@@ -277,7 +317,7 @@ class WifiEngine(
         p2p.requestPeers(ch) { peers: WifiP2pDeviceList? ->
             val list = mutableListOf<PeerDevice>()
             peers?.deviceList?.forEach { device ->
-                if (!isExcludedDevice(device)) {
+                if (isEligiblePeer(device)) {
                     discoveredDevices[device.deviceAddress] = device
                     list.add(
                         PeerDevice(
@@ -294,18 +334,16 @@ class WifiEngine(
         }
     }
 
-    private fun isExcludedDevice(device: WifiP2pDevice): Boolean {
-        val name = device.deviceName?.lowercase() ?: ""
-        val primaryType = device.primaryDeviceType?.lowercase() ?: ""
-
-        val excludedKeywords = listOf("tv", "bravia", "samsung", "lg webos", "roku", "printer", "chromecast", "display", "fridge")
-        if (excludedKeywords.any { name.contains(it) }) return true
-
-        if (primaryType.startsWith("7-") || primaryType.startsWith("3-") || primaryType.startsWith("8-")) {
-            return true
-        }
-
-        return false
+    /**
+     * Only phones/tablets/computers can run RadioClip. Wi-Fi Direct reports a "primary device type"
+     * such as "10-0050F204-5" (category 10 = telephone, 1 = computer); TVs, printers, speakers etc.
+     * use other categories. Devices that report no type are kept so nothing is hidden by mistake.
+     * (Matching on device *names* is unreliable: a phone called "Samsung Galaxy" is not a TV.)
+     */
+    private fun isEligiblePeer(device: WifiP2pDevice): Boolean {
+        val type = device.primaryDeviceType?.trim().orEmpty()
+        if (type.isEmpty()) return true
+        return type.startsWith("10-") || type.startsWith("1-")
     }
 
     override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.IO) {
@@ -417,26 +455,32 @@ class WifiEngine(
     }
 
     /**
-     * Sends a minimal hello packet to the Group Owner immediately after joining the P2P group.
-     * This causes the GO's ServerSocket to accept the connection and register our IP address,
-     * which the GO needs to send data back to this client device.
+     * Sends a minimal, encrypted hello to the Group Owner right after joining the P2P group.
+     * The GO registers our IP address once the hello authenticates, which it needs to send data
+     * back to this client.
      */
     private fun sendHelloToGroupOwner(goAddress: String?) {
         if (goAddress.isNullOrBlank()) return
         scope.launch(Dispatchers.IO) {
+            val key = keyProvider()
+            if (key == null) {
+                Log.w(TAG, "Not paired yet: skipping hello to Group Owner")
+                return@launch
+            }
             try {
                 delay(1500) // Brief wait for DHCP/routing to be fully ready
                 Socket().use { socket ->
-                    socket.connect(InetSocketAddress(goAddress, PORT), SOCKET_TIMEOUT_MS)
-                    val output = DataOutputStream(socket.getOutputStream())
-                    // Send a TYPE_TEXT hello so GO's protocol parser can handle it cleanly
-                    output.writeByte(TYPE_TEXT.toInt())
-                    output.writeUTF("__radioclip_hello__")
+                    socket.connect(InetSocketAddress(goAddress, PORT), CONNECT_TIMEOUT_MS)
+                    socket.soTimeout = IO_TIMEOUT_MS
+                    val output = DataOutputStream(SecureOutputStream(socket.getOutputStream(), key))
+                    output.writeByte(TYPE_HELLO.toInt())
+                    output.writeUTF(java.util.UUID.randomUUID().toString())
                     output.writeLong(System.currentTimeMillis())
-                    output.writeUTF("__peer_hello__")
                     output.flush()
                 }
                 Log.d(TAG, "Peer hello sent to Group Owner: $goAddress")
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.w(TAG, "Peer hello to GO failed (non-critical): ${e.message}")
             }
@@ -449,20 +493,26 @@ class WifiEngine(
         serverJob?.cancel()
         serverJob = scope.launch(Dispatchers.IO) {
             try {
-                serverSocket = ServerSocket(PORT).apply {
+                val server = ServerSocket().apply {
                     reuseAddress = true
+                    bind(InetSocketAddress(PORT))
                 }
+                serverSocket = server
                 Log.d(TAG, "ServerSocket listening on port $PORT (isGO=$isGroupOwner)")
 
                 while (isActive) {
-                    val socket = serverSocket?.accept() ?: break
-                    val clientIp = socket.inetAddress?.hostAddress
-                    if (clientIp != null && isGroupOwner) {
-                        connectedClientIps.add(clientIp)
-                        updateConnectedPeersList()
+                    val socket = server.accept()
+                    if (!connectionLimiter.tryAcquire()) {
+                        Log.w(TAG, "Too many simultaneous connections, dropping one")
+                        runCatching { socket.close() }
+                        continue
                     }
                     launch(Dispatchers.IO) {
-                        handleIncomingConnection(socket)
+                        try {
+                            handleIncomingConnection(socket)
+                        } finally {
+                            connectionLimiter.release()
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -508,66 +558,89 @@ class WifiEngine(
         }
     }
 
+    private fun senderNameFor(clientIp: String?): String {
+        if (isGroupOwner) return "Client ($clientIp)"
+        val mac = pendingConnectMac
+        val name = if (mac != null) discoveredDevices[mac]?.deviceName else null
+        return name?.takeIf { it.isNotBlank() } ?: "Group Owner ($clientIp)"
+    }
+
+    private fun receivedFilesDir(): File =
+        (context.getExternalFilesDir("received") ?: File(context.filesDir, "received")).apply { mkdirs() }
+
     private suspend fun handleIncomingConnection(socket: Socket) = withContext(Dispatchers.IO) {
         socket.use { s ->
             try {
-                val input = DataInputStream(s.getInputStream())
+                val key = keyProvider()
+                if (key == null) {
+                    Log.w(TAG, "Dropping incoming connection: not paired")
+                    return@use
+                }
+                s.soTimeout = IO_TIMEOUT_MS
+
+                // Everything below is authenticated: a wrong pairing code fails on the first read.
+                val input = DataInputStream(SecureInputStream(s.getInputStream(), key))
                 val wireType = input.readByte()
                 val payloadId = input.readUTF()
                 val timestamp = input.readLong()
 
                 val clientIp = s.inetAddress?.hostAddress
-                val resolvedSenderName = when {
-                    !isGroupOwner -> {
-                        val mac = pendingConnectMac
-                        val dev = if (mac != null) discoveredDevices[mac] else null
-                        dev?.deviceName?.takeIf { it.isNotBlank() } ?: "Group Owner ($clientIp)"
-                    }
-                    else -> {
-                        // We are Group Owner, find matching client device by looking at discovered devices
-                        val matchingDevice = discoveredDevices.values.firstOrNull { it.status == WifiP2pDevice.CONNECTED }
-                        matchingDevice?.deviceName?.takeIf { it.isNotBlank() } ?: "Client ($clientIp)"
-                    }
+                if (clientIp != null && isGroupOwner && connectedClientIps.add(clientIp)) {
+                    updateConnectedPeersList()
                 }
+                val senderName = senderNameFor(clientIp)
 
                 when (wireType) {
+                    TYPE_HELLO -> {
+                        Log.d(TAG, "Received peer hello from $clientIp - IP registered")
+                    }
+
                     TYPE_TEXT -> {
-                        val text = input.readUTF()
-                        if (text == "__peer_hello__") {
-                            // Client sent a hello to register its IP on the GO's ServerSocket
-                            Log.d(TAG, "Received peer hello from $clientIp — IP registered")
-                            return@use // IP already captured via ServerSocket.accept()
-                        }
+                        val length = input.readInt()
+                        require(length in 0..MAX_TEXT_BYTES) { "Text payload size out of range: $length" }
+                        val bytes = ByteArray(length)
+                        input.readFully(bytes)
+                        val text = String(bytes, Charsets.UTF_8)
+
                         _incomingPayloads.emit(
                             Payload.Text(
                                 id = payloadId,
                                 timestamp = timestamp,
                                 transportType = TransportType.WIFI_DIRECT_SOCKET,
-                                senderDeviceName = resolvedSenderName,
+                                senderDeviceName = senderName,
                                 isOutgoing = false,
                                 content = text
                             )
                         )
-                        Log.d(TAG, "Received Text via Wi-Fi socket from $resolvedSenderName: ${text.take(30)}")
+                        Log.d(TAG, "Received text via Wi-Fi socket from $senderName (${bytes.size} bytes)")
                     }
 
                     TYPE_FILE -> {
                         val fileName = input.readUTF()
-                        val mimeType = input.readUTF()
+                        val mimeType = input.readUTF().take(MAX_MIME_LENGTH)
                         val fileSize = input.readLong()
 
-                        val receivedDir = File(context.cacheDir, "received_files").apply { mkdirs() }
-                        val targetFile = File(receivedDir, fileName)
+                        require(fileSize in 0..MAX_FILE_BYTES) { "File size out of range: $fileSize" }
+                        val dir = receivedFilesDir()
+                        require(dir.usableSpace > fileSize + MIN_FREE_SPACE_BYTES) { "Not enough free space for $fileSize bytes" }
 
-                        targetFile.outputStream().use { out ->
-                            val buffer = ByteArray(64 * 1024)
-                            var remaining = fileSize
-                            while (remaining > 0) {
-                                val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-                                if (read == -1) break
-                                out.write(buffer, 0, read)
-                                remaining -= read
+                        // The name comes from another device: sanitize it and never overwrite a file.
+                        val targetFile = FileNames.reserveUniqueFile(dir, fileName)
+                        var complete = false
+                        try {
+                            targetFile.outputStream().use { out ->
+                                val buffer = ByteArray(64 * 1024)
+                                var remaining = fileSize
+                                while (remaining > 0) {
+                                    val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                                    if (read == -1) throw EOFException("Connection ended with $remaining bytes missing")
+                                    out.write(buffer, 0, read)
+                                    remaining -= read
+                                }
                             }
+                            complete = true
+                        } finally {
+                            if (!complete) targetFile.delete() // never keep half a file
                         }
 
                         _incomingPayloads.emit(
@@ -575,75 +648,137 @@ class WifiEngine(
                                 id = payloadId,
                                 timestamp = timestamp,
                                 transportType = TransportType.WIFI_DIRECT_SOCKET,
-                                senderDeviceName = resolvedSenderName,
+                                senderDeviceName = senderName,
                                 isOutgoing = false,
-                                fileName = fileName,
+                                fileName = targetFile.name,
                                 mimeType = mimeType,
                                 sizeBytes = fileSize,
                                 localPath = targetFile.absolutePath
                             )
                         )
-                        Log.d(TAG, "Received File via Wi-Fi socket from $resolvedSenderName: $fileName ($fileSize bytes)")
+                        Log.d(TAG, "Received file via Wi-Fi socket from $senderName: ${targetFile.name} ($fileSize bytes)")
                     }
+
+                    else -> Log.w(TAG, "Unknown wire type $wireType from $clientIp")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Error handling incoming socket connection", e)
+                Log.w(TAG, "Error handling incoming socket connection: ${e.message}")
             }
         }
     }
 
+    /** A file ready to stream: its exact size and a way to open it. */
+    private class PreparedFile(val size: Long, val open: () -> InputStream)
+
+    private fun prepareFile(payload: Payload.File): PreparedFile {
+        val uri = payload.uriString?.let { Uri.parse(it) }
+        val localPath = payload.localPath
+        val open: () -> InputStream = when {
+            uri != null -> { { context.contentResolver.openInputStream(uri) ?: throw IOException("Cannot open ${payload.fileName}") } }
+            localPath != null -> { { File(localPath).inputStream() } }
+            else -> throw IOException("No source for file payload: ${payload.fileName}")
+        }
+
+        var size = payload.sizeBytes
+        if (size <= 0 && uri != null) {
+            // Some providers don't report a size to the file picker; ask the file descriptor.
+            size = runCatching {
+                context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
+            }.getOrDefault(-1L)
+        }
+        if (size <= 0) {
+            // Still unknown: measure by reading once. The receiver needs the exact size up front.
+            size = open().use { stream ->
+                val buffer = ByteArray(64 * 1024)
+                var total = 0L
+                while (true) {
+                    val read = stream.read(buffer)
+                    if (read < 0) break
+                    total += read
+                }
+                total
+            }
+        }
+        if (size > MAX_FILE_BYTES) throw IOException("File is too large (limit is ${MAX_FILE_BYTES / (1024 * 1024)} MB)")
+        return PreparedFile(size, open)
+    }
+
     override suspend fun send(payload: Payload, targetPeerId: String?): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
-            val destinationIp = when {
-                targetPeerId != null && targetPeerId.contains(".") -> targetPeerId
-                !isGroupOwner && !groupOwnerAddress.isNullOrBlank() -> groupOwnerAddress
-                isGroupOwner && connectedClientIps.isNotEmpty() -> connectedClientIps.first()
-                else -> groupOwnerAddress ?: error("Destination IP unknown. No P2P group formed or client IP recorded.")
+            val key = keyProvider() ?: error("Not paired: enter the same pairing code on both devices first")
+
+            val destinations: List<String> = when {
+                targetPeerId != null && targetPeerId.contains(".") -> listOf(targetPeerId)
+                !isGroupOwner && !groupOwnerAddress.isNullOrBlank() -> listOf(groupOwnerAddress!!)
+                // Group owner: deliver to every client, not just the first one.
+                isGroupOwner && connectedClientIps.isNotEmpty() -> connectedClientIps.toList()
+                else -> error("Destination IP unknown. No P2P group formed or client IP recorded.")
             }
 
-            Log.d(TAG, "Connecting TCP socket to $destinationIp:$PORT to send ${payload.javaClass.simpleName}")
+            val prepared = if (payload is Payload.File) prepareFile(payload) else null
 
-            Socket().use { socket ->
-                socket.connect(InetSocketAddress(destinationIp, PORT), SOCKET_TIMEOUT_MS)
-                val output = DataOutputStream(socket.getOutputStream())
-
-                when (payload) {
-                    is Payload.Text -> {
-                        output.writeByte(TYPE_TEXT.toInt())
-                        output.writeUTF(payload.id)
-                        output.writeLong(payload.timestamp)
-                        output.writeUTF(payload.content)
-                        output.flush()
-                    }
-
-                    is Payload.File -> {
-                        output.writeByte(TYPE_FILE.toInt())
-                        output.writeUTF(payload.id)
-                        output.writeLong(payload.timestamp)
-                        output.writeUTF(payload.fileName)
-                        output.writeUTF(payload.mimeType)
-                        output.writeLong(payload.sizeBytes)
-
-                        val inputStream: InputStream? = if (payload.uriString != null) {
-                            context.contentResolver.openInputStream(Uri.parse(payload.uriString))
-                        } else if (payload.localPath != null) {
-                            File(payload.localPath).inputStream()
-                        } else null
-
-                        inputStream?.use { stream ->
-                            val buffer = ByteArray(64 * 1024)
-                            var read: Int
-                            while (stream.read(buffer).also { read = it } != -1) {
-                                output.write(buffer, 0, read)
-                            }
-                        } ?: error("Unable to open stream for file payload: ${payload.fileName}")
-
-                        output.flush()
-                    }
+            var delivered = 0
+            var lastError: Throwable? = null
+            for (ip in destinations) {
+                try {
+                    sendTo(ip, payload, prepared, key)
+                    delivered++
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Send to $ip failed: ${e.message}")
+                    lastError = e
                 }
-                Log.d(TAG, "Successfully sent payload to $destinationIp")
-                Unit
             }
+            if (delivered == 0) throw (lastError ?: IllegalStateException("Nothing was sent"))
+        }
+    }
+
+    private fun sendTo(ip: String, payload: Payload, prepared: PreparedFile?, key: ByteArray) {
+        Log.d(TAG, "Connecting TCP socket to $ip:$PORT to send ${payload.javaClass.simpleName}")
+
+        Socket().use { socket ->
+            socket.connect(InetSocketAddress(ip, PORT), CONNECT_TIMEOUT_MS)
+            socket.soTimeout = IO_TIMEOUT_MS
+            val output = DataOutputStream(SecureOutputStream(socket.getOutputStream(), key))
+
+            when (payload) {
+                is Payload.Text -> {
+                    val bytes = payload.content.toByteArray(Charsets.UTF_8)
+                    if (bytes.size > MAX_TEXT_BYTES) throw IOException("Text is too large (limit is ${MAX_TEXT_BYTES / 1024} KB)")
+                    output.writeByte(TYPE_TEXT.toInt())
+                    output.writeUTF(payload.id)
+                    output.writeLong(payload.timestamp)
+                    output.writeInt(bytes.size)
+                    output.write(bytes)
+                    output.flush()
+                }
+
+                is Payload.File -> {
+                    val file = prepared ?: throw IllegalStateException("File was not prepared")
+                    output.writeByte(TYPE_FILE.toInt())
+                    output.writeUTF(payload.id)
+                    output.writeLong(payload.timestamp)
+                    output.writeUTF(payload.fileName)
+                    output.writeUTF(payload.mimeType)
+                    output.writeLong(file.size)
+
+                    file.open().use { stream ->
+                        val buffer = ByteArray(64 * 1024)
+                        var remaining = file.size
+                        while (remaining > 0) {
+                            val read = stream.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                            if (read < 0) throw EOFException("File ended $remaining bytes early")
+                            output.write(buffer, 0, read)
+                            remaining -= read
+                        }
+                    }
+                    output.flush()
+                }
+            }
+            Log.d(TAG, "Successfully sent payload to $ip")
         }
     }
 }

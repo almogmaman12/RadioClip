@@ -35,6 +35,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -51,6 +52,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.almog.radioclip.core.Crypto
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.PeerDevice
 import com.almog.radioclip.model.TransportState
@@ -62,6 +64,9 @@ import java.util.Locale
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DashboardScreen(
+    isPaired: Boolean,
+    onSetPairingCode: (String) -> Unit,
+    onClearPairing: () -> Unit,
     bleState: TransportState,
     wifiState: TransportState,
     discoveredBlePeers: List<PeerDevice>,
@@ -146,6 +151,15 @@ fun DashboardScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // Pairing code: all traffic is encrypted with it
+            item {
+                PairingCard(
+                    isPaired = isPaired,
+                    onSetCode = onSetPairingCode,
+                    onClear = onClearPairing
+                )
+            }
+
             // Transport Status Cards
             item {
                 Row(
@@ -288,6 +302,78 @@ fun DashboardScreen(
             } else {
                 items(history, key = { it.id }) { payload ->
                     PayloadItem(payload = payload)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PairingCard(
+    isPaired: Boolean,
+    onSetCode: (String) -> Unit,
+    onClear: () -> Unit
+) {
+    var code by remember { mutableStateOf("") }
+    var editing by remember { mutableStateOf(false) }
+    val showForm = !isPaired || editing
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isPaired) MaterialTheme.colorScheme.surfaceContainer
+            else MaterialTheme.colorScheme.errorContainer
+        ),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                if (isPaired) "Encrypted ✓" else "Not paired",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+
+            if (!showForm) {
+                Text(
+                    "Clipboard text and files are encrypted with your pairing code. " +
+                        "Other devices need the same code.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { editing = true }) { Text("Change code") }
+                    TextButton(onClick = onClear) { Text("Remove") }
+                }
+            } else {
+                Text(
+                    "Nothing is sent or accepted until you pair. Use the same code on every " +
+                        "device: generate one here, type it on the other device, then press Pair on both.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = code,
+                    onValueChange = { code = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Pairing code (at least ${Crypto.MIN_CODE_LENGTH} characters)") },
+                    singleLine = true
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { code = Crypto.generateCode() }) { Text("Generate") }
+                    Button(
+                        enabled = Crypto.isAcceptableCode(code),
+                        onClick = {
+                            onSetCode(code)
+                            code = ""
+                            editing = false
+                        }
+                    ) { Text("Pair") }
+                    if (editing) {
+                        TextButton(onClick = { editing = false; code = "" }) { Text("Cancel") }
+                    }
                 }
             }
         }

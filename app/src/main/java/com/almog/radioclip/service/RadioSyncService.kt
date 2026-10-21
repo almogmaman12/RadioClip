@@ -19,15 +19,19 @@ import com.almog.radioclip.MainActivity
 import com.almog.radioclip.R
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.TransportType
+import com.almog.radioclip.core.Crypto
 import com.almog.radioclip.routing.SyncRouter
+import com.almog.radioclip.security.PairingStore
 import com.almog.radioclip.transport.ble.BleEngine
 import com.almog.radioclip.transport.wifi.WifiEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
@@ -38,6 +42,7 @@ class RadioSyncService : Service() {
         const val CHANNEL_ID = "radioclip_sync_channel"
         const val FILE_ALERT_CHANNEL_ID = "radioclip_files_channel"
         const val NOTIFICATION_ID = 1001
+        private const val MAX_HISTORY = 200
 
         // Singleton instance pattern so UI always shares exactly the same history and state
         var activeInstance: RadioSyncService? = null
@@ -72,8 +77,19 @@ class RadioSyncService : Service() {
     lateinit var router: SyncRouter
         private set
 
+    lateinit var pairing: PairingStore
+        private set
+
     private val _history = MutableStateFlow<List<Payload>>(emptyList())
     val history: StateFlow<List<Payload>> = _history.asStateFlow()
+
+    // Short messages for the UI to show as toasts (send failures, pairing result).
+    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    val messages: SharedFlow<String> = _messages.asSharedFlow()
+
+    private fun addToHistory(payload: Payload) {
+        _history.value = (listOf(payload) + _history.value).take(MAX_HISTORY)
+    }
 
     private var clipboardManager: ClipboardManager? = null
     private var lastSyncedClipboardText: String? = null
@@ -91,8 +107,9 @@ class RadioSyncService : Service() {
         activeInstance = this
         createNotificationChannel()
 
-        bleEngine = BleEngine(applicationContext, serviceScope)
-        wifiEngine = WifiEngine(applicationContext, serviceScope)
+        pairing = PairingStore(applicationContext)
+        bleEngine = BleEngine(applicationContext, serviceScope) { pairing.key }
+        wifiEngine = WifiEngine(applicationContext, serviceScope) { pairing.key }
         router = SyncRouter(bleEngine, wifiEngine, serviceScope)
 
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -101,8 +118,8 @@ class RadioSyncService : Service() {
         // Observe incoming payloads from peers
         serviceScope.launch {
             router.incomingPayloads.collect { payload ->
-                Log.d(TAG, "Incoming payload collected in service: $payload")
-                _history.value = listOf(payload) + _history.value
+                Log.d(TAG, "Incoming payload collected in service: ${payload.javaClass.simpleName} from ${payload.senderDeviceName}")
+                addToHistory(payload)
 
                 // If incoming payload is text, update local clipboard without re-broadcasting
                 if (payload is Payload.Text) {
@@ -161,6 +178,8 @@ class RadioSyncService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startAsForegroundService()
 
+        // Engine start() calls are idempotent, so repeated onStartCommand calls are harmless
+        // (and retry Bluetooth if permissions were granted after the first start).
         serviceScope.launch {
             bleEngine.start()
             wifiEngine.start()
@@ -175,8 +194,9 @@ class RadioSyncService : Service() {
             val text = clip.getItemAt(0)?.text?.toString()
             if (!text.isNullOrBlank() && text != lastSyncedClipboardText) {
                 lastSyncedClipboardText = text
-                Log.d(TAG, "Auto-detected clipboard change: ${text.take(30)}")
-                sendPayload(Payload.Text(content = text, isOutgoing = true))
+                Log.d(TAG, "Auto-detected clipboard change (${text.length} chars)")
+                // Automatic sync: stay quiet when nobody is connected or we are not paired yet.
+                sendPayload(Payload.Text(content = text, isOutgoing = true), notifyFailure = false)
             }
         }
     }
@@ -269,23 +289,45 @@ class RadioSyncService : Service() {
         }
     }
 
-    fun sendPayload(payload: Payload) {
+    /**
+     * Sends a payload to connected peers. Only payloads that were actually delivered are added to
+     * the history; failures are reported through [messages] when [notifyFailure] is true.
+     */
+    fun sendPayload(payload: Payload, notifyFailure: Boolean = true) {
         serviceScope.launch {
             val result = router.route(payload)
-            val actualTransport = result.getOrNull() ?: payload.transportType
+            val actualTransport = result.getOrNull()
+
+            if (actualTransport == null) {
+                val reason = result.exceptionOrNull()?.message ?: "unknown error"
+                Log.w(TAG, "Failed to route payload: $reason")
+                if (notifyFailure) _messages.tryEmit("Could not send: $reason")
+                return@launch
+            }
+
             val record = when (payload) {
                 is Payload.Text -> payload.copy(transportType = actualTransport, isOutgoing = true)
                 is Payload.File -> payload.copy(transportType = actualTransport, isOutgoing = true)
             }
-            // Always add to history for user visibility, whether routed immediately or queued
-            _history.value = listOf(record) + _history.value
-
-            if (result.isFailure) {
-                Log.w(TAG, "Failed to route payload: ${result.exceptionOrNull()?.message}")
-            } else {
-                Log.d(TAG, "Payload routed successfully over $actualTransport")
-            }
+            addToHistory(record)
+            Log.d(TAG, "Payload routed successfully over $actualTransport")
         }
+    }
+
+    /** Sets the shared pairing code (key derivation is CPU-heavy, so this runs off the main thread). */
+    fun setPairingCode(code: String) {
+        serviceScope.launch(Dispatchers.Default) {
+            val ok = pairing.setCode(code)
+            _messages.tryEmit(
+                if (ok) "Paired: clipboard text and files are now encrypted"
+                else "Pairing code must be at least ${Crypto.MIN_CODE_LENGTH} characters"
+            )
+        }
+    }
+
+    fun clearPairing() {
+        pairing.clear()
+        _messages.tryEmit("Pairing removed: nothing will be sent or accepted until you pair again")
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -296,10 +338,20 @@ class RadioSyncService : Service() {
             activeInstance = null
         }
         clipboardManager?.removePrimaryClipChangedListener(clipboardListener)
-        serviceScope.launch {
-            bleEngine.stop()
-            wifiEngine.stop()
+
+        // Stop the radios first and only then cancel the service scope. Cancelling right away
+        // (as before) killed the stop() coroutines before they ran, leaking the GATT server,
+        // advertising and the Wi-Fi Direct group.
+        val ble = bleEngine
+        val wifi = wifiEngine
+        val job = serviceJob
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                ble.stop()
+                wifi.stop()
+            } finally {
+                job.cancel()
+            }
         }
-        serviceJob.cancel()
     }
 }

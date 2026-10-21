@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Only the folder where received files are stored can be shared with other apps. -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <cache-path name="cache_files" path="." />
-    <cache-path name="received_files" path="received_files/" />
-    <files-path name="internal_files" path="." />
+    <external-files-path name="received_external" path="received/" />
+    <files-path name="received_internal" path="received/" />
 </paths>

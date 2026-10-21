@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -31,6 +32,7 @@ class MainActivity : ComponentActivity() {
 
     private var syncService: RadioSyncService? by mutableStateOf(RadioSyncService.activeInstance)
     private var isBound by mutableStateOf(false)
+    private var bindRequested = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -67,11 +69,10 @@ class MainActivity : ComponentActivity() {
             RadioClipTheme {
                 val permissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
-                ) { permissions ->
-                    val allGranted = permissions.values.all { it }
-                    if (allGranted) {
-                        startAndBindService()
-                    }
+                ) { _ ->
+                    // Start even if some permissions were denied (for example notifications): each
+                    // transport checks what it needs and the service retries when asked again.
+                    startAndBindService()
                 }
 
                 // File picker launcher that can be triggered from UI or from notification action
@@ -109,14 +110,21 @@ class MainActivity : ComponentActivity() {
                     }
 
                     onDispose {
-                        if (isBound) {
+                        if (bindRequested) {
                             unbindService(serviceConnection)
+                            bindRequested = false
                             isBound = false
                         }
                     }
                 }
 
                 val currentService = syncService
+
+                androidx.compose.runtime.LaunchedEffect(currentService) {
+                    currentService?.messages?.collect { message ->
+                        Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+                    }
+                }
                 val bleState = currentService?.bleEngine?.state?.collectAsState()?.value
                     ?: TransportState.IDLE
                 val wifiState = currentService?.wifiEngine?.state?.collectAsState()?.value
@@ -126,8 +134,12 @@ class MainActivity : ComponentActivity() {
                 val connectedBlePeers = currentService?.bleEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
                 val connectedWifiPeers = currentService?.wifiEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
                 val history = currentService?.history?.collectAsState()?.value ?: emptyList()
+                val isPaired = currentService?.pairing?.isPaired?.collectAsState()?.value ?: false
 
                 DashboardScreen(
+                    isPaired = isPaired,
+                    onSetPairingCode = { code -> currentService?.setPairingCode(code) },
+                    onClearPairing = { currentService?.clearPairing() },
                     bleState = bleState,
                     wifiState = wifiState,
                     discoveredBlePeers = discoveredBlePeers,
@@ -179,8 +191,10 @@ class MainActivity : ComponentActivity() {
 
     private fun startAndBindService() {
         RadioSyncService.start(this)
-        val intent = Intent(this, RadioSyncService::class.java)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        if (!bindRequested) {
+            val intent = Intent(this, RadioSyncService::class.java)
+            bindRequested = bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        }
     }
 
     private fun checkAndRequestPermissions(onReady: (List<String>) -> Unit) {
