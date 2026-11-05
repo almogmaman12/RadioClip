@@ -9,10 +9,10 @@ sealed class BleMessage {
     data class Text(val id: String, val text: String) : BleMessage()
 
     /** Tells the peer our device name (sent after connecting, so the name never goes over the air in clear). */
-    data class Hello(val deviceName: String) : BleMessage()
+    data class Hello(val deviceName: String, val nodeId: Int = 0) : BleMessage()
 }
 
-/** Wire format: `[type: 1 byte][body]`. Text body = `[uuid: 16 bytes][utf-8 text]`, hello body = utf-8 name. */
+/** Wire format: `[type: 1 byte][body]`. Text body = `[uuid: 16 bytes][utf-8 text]`, hello body = `[node id: 4 bytes][utf-8 name]` (the node id identifies the phone even when its Bluetooth address changes). */
 object BleMessages {
     private const val TYPE_TEXT = 1
     private const val TYPE_HELLO = 2
@@ -30,13 +30,14 @@ object BleMessages {
         }.array()
     }
 
-    fun encodeHello(name: String): ByteArray {
+    fun encodeHello(name: String, nodeId: Int = 0): ByteArray {
         val clean = cleanName(name)
         val bytes = truncateUtf8(clean, MAX_NAME_BYTES)
-        return ByteArray(1 + bytes.size).also {
-            it[0] = TYPE_HELLO.toByte()
-            System.arraycopy(bytes, 0, it, 1, bytes.size)
-        }
+        return ByteBuffer.allocate(1 + 4 + bytes.size).apply {
+            put(TYPE_HELLO.toByte())
+            putInt(nodeId)
+            put(bytes)
+        }.array()
     }
 
     /** Returns null for anything malformed or unknown, so garbage can never crash the receiver. */
@@ -53,8 +54,10 @@ object BleMessages {
                 )
             }
             TYPE_HELLO -> {
-                val name = cleanName(String(data, 1, data.size - 1, Charsets.UTF_8))
-                if (name.isEmpty()) null else BleMessage.Hello(name)
+                if (data.size < 1 + 4) return null
+                val nodeId = ByteBuffer.wrap(data, 1, 4).int
+                val name = cleanName(String(data, 5, data.size - 5, Charsets.UTF_8))
+                if (name.isEmpty()) null else BleMessage.Hello(name, nodeId)
             }
             else -> null
         }

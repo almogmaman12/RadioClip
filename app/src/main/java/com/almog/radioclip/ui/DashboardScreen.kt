@@ -71,6 +71,7 @@ fun DashboardScreen(
     onClearPairing: () -> Unit,
     bleState: TransportState,
     wifiState: TransportState,
+    wifiError: String?,
     discoveredBlePeers: List<PeerDevice>,
     discoveredWifiPeers: List<PeerDevice>,
     connectedBlePeers: List<PeerDevice>,
@@ -214,6 +215,7 @@ fun DashboardScreen(
                             title = "Wi-Fi Direct",
                             subtitle = "Files & Large Payloads",
                             state = wifiState,
+                            detail = if (wifiState == TransportState.ERROR) wifiError else null,
                             connectedCount = connectedWifiPeers.size
                         )
                     }
@@ -537,7 +539,8 @@ fun StatusCard(
     title: String,
     subtitle: String,
     state: TransportState,
-    connectedCount: Int = 0
+    connectedCount: Int = 0,
+    detail: String? = null
 ) {
     val statusColor = when (state) {
         TransportState.CONNECTED -> Color(0xFF2E7D32)
@@ -570,6 +573,13 @@ fun StatusCard(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            if (detail != null) {
+                Text(
+                    detail,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColor
+                )
+            }
             Spacer(modifier = Modifier.height(6.dp))
             Row(
                 horizontalArrangement = Arrangement.SpaceBetween,

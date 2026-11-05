@@ -107,6 +107,10 @@ class WifiEngine(
     private val _state = MutableStateFlow(TransportState.IDLE)
     override val state: StateFlow<TransportState> = _state.asStateFlow()
 
+    /** Short explanation shown on the dashboard when [state] is ERROR. */
+    private val _errorDetail = MutableStateFlow<String?>(null)
+    val errorDetail: StateFlow<String?> = _errorDetail.asStateFlow()
+
     private val _discoveredPeers = MutableStateFlow<List<PeerDevice>>(emptyList())
     override val discoveredPeers: StateFlow<List<PeerDevice>> = _discoveredPeers.asStateFlow()
 
@@ -173,13 +177,15 @@ class WifiEngine(
                     val p2pState = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
                     if (p2pState == WifiP2pManager.WIFI_P2P_STATE_ENABLED) {
                         log("Wi-Fi Direct enabled")
+                        _errorDetail.value = null
                         if (handledGroupKey == null) {
                             _state.value = TransportState.SCANNING
                             startPeerDiscovery()
                         }
                     } else {
-                        log("Wi-Fi Direct disabled")
+                        log("Wi-Fi Direct disabled (state $p2pState)")
                         _state.value = TransportState.ERROR
+                        _errorDetail.value = "Turn Wi-Fi on (no internet needed)"
                         notice("p2p-off", "Wi-Fi is off. Wi-Fi Direct needs Wi-Fi turned on.", 60_000)
                     }
                 }
@@ -201,6 +207,7 @@ class WifiEngine(
         if (started) return@withContext
         if (!isAvailable()) {
             _state.value = TransportState.ERROR
+            _errorDetail.value = "This device has no Wi-Fi Direct"
             return@withContext
         }
         started = true

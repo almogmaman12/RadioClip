@@ -62,4 +62,17 @@ class BleMessageTest {
         assertNull(BleMessages.decode(byteArrayOf(99, 1, 2, 3)))
         assertNull(BleMessages.decode(byteArrayOf(1, 0, 0)))   // text message too short for its id
     }
+
+    @Test
+    fun helloCarriesNodeId() {
+        assertEquals(
+            BleMessage.Hello("Pixel", -123456),
+            BleMessages.decode(BleMessages.encodeHello("Pixel", -123456))
+        )
+    }
+
+    @Test
+    fun truncatedHelloIsRejected() {
+        assertNull(BleMessages.decode(byteArrayOf(2, 0, 0)))
+    }
 }

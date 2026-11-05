@@ -141,6 +141,8 @@ class BleEngine(
     private val remoteNodeIds = ConcurrentHashMap<String, Int>()
     private val lastSeen = ConcurrentHashMap<String, Long>()
     private val peerNames = ConcurrentHashMap<String, String>()
+    /** Node ids learned from the hello message. Phones change their Bluetooth address, the node id stays. */
+    private val peerNodeIds = ConcurrentHashMap<String, Int>()
     private val clientMtuMap = ConcurrentHashMap<String, Int>()
     private val serverMtuMap = ConcurrentHashMap<String, Int>()
     private val writeAcks = ConcurrentHashMap<String, Channel<Int>>()
@@ -356,6 +358,7 @@ class BleEngine(
         }
         targetReconnectAddresses.clear()
         peerNames.clear()
+        peerNodeIds.clear()
         teardownRadios()
     }
 
@@ -674,6 +677,9 @@ class BleEngine(
         // Both phones see each other; only the one with the higher node id connects.
         if (info != null && !Advertisement.shouldInitiate(nodeId, info.nodeId)) return
 
+        // The same phone may show up under a new (rotated) address while it is already linked.
+        if (info != null && info.nodeId != 0 && info.nodeId in connectedNodeIds()) return
+
         if (!activeGattClients.containsKey(address) && _connectedPeers.value.none { it.id == address }) {
             log("Connecting to ${DiagLog.mask(address)}")
             connectToPeerDevice(device)
@@ -682,13 +688,18 @@ class BleEngine(
 
     private fun upsertDiscovered(peer: PeerDevice) = synchronized(peersLock) {
         val list = _discoveredPeers.value.toMutableList()
-        val index = list.indexOfFirst { it.id == peer.id }
-        if (index == -1) {
+        val node = nodeIdOf(peer.id)
+        // A rotated address of a phone we already list replaces the old entry.
+        val sameNode = if (node == null) -1 else list.indexOfFirst { it.id != peer.id && nodeIdOf(it.id) == node }
+        if (sameNode != -1 && !list[sameNode].isConnected) list.removeAt(sameNode)
+        else if (sameNode != -1) return@synchronized
+        val at = list.indexOfFirst { it.id == peer.id }
+        if (at == -1) {
             list.add(peer)
             _discoveredPeers.value = list
             log("Found ${DiagLog.mask(peer.id)} ${Format.signalLabel(peer.rssi)}")
-        } else if (list[index] != peer) {
-            list[index] = peer
+        } else if (list[at] != peer) {
+            list[at] = peer
             _discoveredPeers.value = list
         }
     }
@@ -882,6 +893,22 @@ class BleEngine(
             ?: device?.let { runCatching { it.name }.getOrNull()?.takeIf { n -> n.isNotBlank() } }
             ?: "RadioClip (${address.takeLast(5)})"
 
+    /** Identifies the phone behind an address, whichever address it currently uses. */
+    private fun nodeIdOf(address: String): Int? =
+        (peerNodeIds[address] ?: remoteNodeIds[address])?.takeIf { it != 0 }
+
+    /** Shows each phone once, even if it is linked under several addresses. Peers with an unknown node id stay as they are. */
+    private fun collapseByNode(peers: List<PeerDevice>): List<PeerDevice> {
+        val seen = HashSet<Int>()
+        return peers.filter { peer ->
+            val node = nodeIdOf(peer.id)
+            node == null || seen.add(node)
+        }
+    }
+
+    private fun connectedNodeIds(): Set<Int> =
+        _connectedPeers.value.mapNotNull { nodeIdOf(it.id) }.toSet()
+
     private fun updateConnectedPeers(address: String, name: String, isConnected: Boolean) {
         // A peer can be connected in both roles; it only counts as gone when neither is left.
         val stillConnected = isConnected ||
@@ -899,11 +926,11 @@ class BleEngine(
                     )
                 )
             }
-            _connectedPeers.value = current
+            _connectedPeers.value = collapseByNode(current)
 
-            _discoveredPeers.value = _discoveredPeers.value.map { peer ->
+            _discoveredPeers.value = collapseByNode(_discoveredPeers.value.map { peer ->
                 if (peer.id == address) peer.copy(isConnected = stillConnected, name = name) else peer
-            }
+            })
         }
 
         if (radiosUp) {
@@ -912,12 +939,17 @@ class BleEngine(
         }
     }
 
-    private fun peerNameLearned(address: String, name: String) {
+    private fun peerNameLearned(address: String, name: String, node: Int = 0) {
         peerNames[address] = name
+        if (node != 0) peerNodeIds[address] = node
         log("Peer ${DiagLog.mask(address)} is \"$name\"")
         synchronized(peersLock) {
-            _connectedPeers.value = _connectedPeers.value.map { if (it.id == address) it.copy(name = name) else it }
-            _discoveredPeers.value = _discoveredPeers.value.map { if (it.id == address) it.copy(name = name) else it }
+            _connectedPeers.value = collapseByNode(
+                _connectedPeers.value.map { if (it.id == address) it.copy(name = name) else it }
+            )
+            _discoveredPeers.value = collapseByNode(
+                _discoveredPeers.value.map { if (it.id == address) it.copy(name = name) else it }
+            )
         }
     }
 
@@ -932,13 +964,16 @@ class BleEngine(
 
     /** Addresses we can currently send to: ready client links, and server-side peers that subscribed. */
     private fun sendableAddresses(): List<String> =
-        (readyClients.toList() + subscribedDevices.filter { serverConnectedDevices.containsKey(it) }).distinct()
+        (readyClients.toList() + subscribedDevices.filter { serverConnectedDevices.containsKey(it) })
+            .distinct()
+            // One phone can be linked under two addresses (and in both roles): send to it once.
+            .distinctBy { nodeIdOf(it) ?: it }
 
     private suspend fun sendHello(address: String) {
         if (keyProvider() == null) return
         val name = settingsProvider().announcedName(Build.MODEL ?: "Android")
         try {
-            sendMessage(BleMessages.encodeHello(name), address)
+            sendMessage(BleMessages.encodeHello(name, nodeId), address)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1110,7 +1145,7 @@ class BleEngine(
                     )
                 )
             }
-            is BleMessage.Hello -> peerNameLearned(senderAddress, message.deviceName)
+            is BleMessage.Hello -> peerNameLearned(senderAddress, message.deviceName, message.nodeId)
             null -> log("Ignored an unreadable message from ${DiagLog.mask(senderAddress)}")
         }
     }

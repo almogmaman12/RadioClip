@@ -135,6 +135,7 @@ class MainActivity : ComponentActivity() {
                     ?: TransportState.IDLE
                 val wifiState = currentService?.wifiEngine?.state?.collectAsState()?.value
                     ?: TransportState.IDLE
+                val wifiError = currentService?.wifiEngine?.errorDetail?.collectAsState()?.value
                 val discoveredBlePeers = currentService?.bleEngine?.discoveredPeers?.collectAsState()?.value ?: emptyList()
                 val discoveredWifiPeers = currentService?.wifiEngine?.discoveredPeers?.collectAsState()?.value ?: emptyList()
                 val connectedBlePeers = currentService?.bleEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
@@ -181,6 +182,7 @@ class MainActivity : ComponentActivity() {
                     onClearPairing = { currentService?.clearPairing() },
                     bleState = bleState,
                     wifiState = wifiState,
+                    wifiError = wifiError,
                     discoveredBlePeers = discoveredBlePeers,
                     discoveredWifiPeers = discoveredWifiPeers,
                     connectedBlePeers = connectedBlePeers,
