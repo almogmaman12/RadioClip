@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Only the folder where received files are stored can be shared with other apps. -->
+<!-- Only these folders can be shared with other apps (to open received/sent files). -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <external-files-path name="received_external" path="received/" />
     <files-path name="received_internal" path="received/" />
+    <cache-path name="outgoing" path="outgoing/" />
 </paths>

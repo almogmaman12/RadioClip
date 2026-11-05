@@ -5,23 +5,31 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.net.NetworkInfo
 import android.net.Uri
+import android.net.wifi.WpsInfo
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pDeviceList
+import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.almog.radioclip.core.BleMessages
+import com.almog.radioclip.core.ClipPolicy
+import com.almog.radioclip.core.DiagLog
 import com.almog.radioclip.core.FileNames
+import com.almog.radioclip.core.FrameAuthenticationException
 import com.almog.radioclip.core.SecureInputStream
 import com.almog.radioclip.core.SecureOutputStream
+import com.almog.radioclip.core.Settings
+import com.almog.radioclip.core.WifiDeviceTypes
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.PeerDevice
 import com.almog.radioclip.model.TransportState
 import com.almog.radioclip.model.TransportType
+import com.almog.radioclip.storage.AppFiles
 import com.almog.radioclip.transport.DeviceTransport
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -47,15 +55,28 @@ import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.Continuation
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
+/**
+ * Wi-Fi Direct transport for files and large text.
+ *
+ * Wi-Fi Direct forms a small group with one "group owner" (GO) and clients. Whichever phone
+ * becomes GO is decided by Android, so BOTH roles must work:
+ *  - a client says hello to the GO (and repeats it as a heartbeat) so the GO learns the client's
+ *    IP address, name and that it is still there;
+ *  - the GO tracks its clients and drops the ones it stops hearing from.
+ */
 @SuppressLint("MissingPermission")
 class WifiEngine(
     private val context: Context,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job()),
-    private val keyProvider: () -> ByteArray? = { null }
+    private val keyProvider: () -> ByteArray? = { null },
+    private val settingsProvider: () -> Settings = { Settings() },
+    private val onNotice: (String) -> Unit = {}
 ) : DeviceTransport {
 
     companion object {
@@ -65,10 +86,15 @@ class WifiEngine(
         private const val IO_TIMEOUT_MS = 30_000
         private const val MAX_CONCURRENT_CONNECTIONS = 6
 
-        const val MAX_FILE_BYTES = 1L shl 30        // 1 GiB
-        const val MAX_TEXT_BYTES = 1 shl 20         // 1 MiB
+        const val MAX_FILE_BYTES = 1L shl 30                 // 1 GiB
+        const val MAX_TEXT_BYTES = ClipPolicy.MAX_TEXT_BYTES
         private const val MIN_FREE_SPACE_BYTES = 50L * 1024 * 1024
         private const val MAX_MIME_LENGTH = 255
+
+        private const val REQUEST_ACCEPT_TIMEOUT_MS = 45_000L   // how long the other phone has to accept
+        private const val HELLO_INTERVAL_MS = 20_000L           // client heartbeat
+        private const val CLIENT_TIMEOUT_MS = 75_000L           // GO forgets a client after this much silence
+        private const val DISCOVERY_REFRESH_MS = 60_000L        // Android stops discovery by itself after ~2 min
 
         // Stream wire protocol tags
         private const val TYPE_TEXT: Byte = 1
@@ -96,12 +122,16 @@ class WifiEngine(
 
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
+    private var connectionMonitorJob: Job? = null
+    private var connectTimeoutJob: Job? = null
+    private var helloJob: Job? = null
     private var isReceiverRegistered = false
 
-    @Volatile
-    private var started = false
+    @Volatile private var started = false
+    @Volatile private var lastDiscoveryAt = 0L
 
     private val connectionLimiter = Semaphore(MAX_CONCURRENT_CONNECTIONS)
+    private val noticeTimes = ConcurrentHashMap<String, Long>()
 
     @Volatile
     var groupOwnerAddress: String? = null
@@ -111,69 +141,61 @@ class WifiEngine(
     var isGroupOwner: Boolean = false
         private set
 
-    private val connectedClientIps = ConcurrentHashMap.newKeySet<String>()
+    /** Identifies the group we already handled, so repeated "group formed" reports are ignored. */
+    @Volatile private var handledGroupKey: String? = null
+
+    // Group owner side: clients that said hello (ip -> last time heard) and their names.
+    private val connectedClientIps = ConcurrentHashMap<String, Long>()
+    private val clientNames = ConcurrentHashMap<String, String>()
+
+    // Client side: the group owner we joined.
+    @Volatile private var ownerPeer: PeerDevice? = null
+
     private val discoveredDevices = ConcurrentHashMap<String, WifiP2pDevice>()
 
-    // MAC address of the peer we initiated connect() to, used for UI ID matching
-    @Volatile
-    private var pendingConnectMac: String? = null
+    // MAC address of the peer we initiated connect() to.
+    @Volatile private var pendingConnectMac: String? = null
+
+    private fun log(message: String) = DiagLog.d(TAG, message)
+
+    private fun notice(key: String, text: String, intervalMs: Long = 30_000) {
+        val now = System.currentTimeMillis()
+        val last = noticeTimes[key] ?: 0L
+        if (now - last < intervalMs) return
+        noticeTimes[key] = now
+        onNotice(text)
+    }
 
     private val p2pReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
             when (intent?.action) {
                 WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
                     val p2pState = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
-                    if (p2pState != WifiP2pManager.WIFI_P2P_STATE_ENABLED) {
-                        _state.value = TransportState.ERROR
-                    }
-                }
-
-                WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
-                    requestPeers()
-                }
-
-                WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
-                    val networkInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO, NetworkInfo::class.java)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        intent.getParcelableExtra<NetworkInfo>(WifiP2pManager.EXTRA_NETWORK_INFO)
-                    }
-
-                    // Android 10+ (Q) includes WifiP2pInfo directly in the intent extras
-                    // This is more reliable than NetworkInfo which can be null even when connected
-                    val directP2pInfo: WifiP2pInfo? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_INFO, WifiP2pInfo::class.java)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            intent.getParcelableExtra<WifiP2pInfo>(WifiP2pManager.EXTRA_WIFI_P2P_INFO)
-                        }
-                    } else null
-
-                    if (networkInfo?.isConnected == true || directP2pInfo?.groupFormed == true) {
-                        requestConnectionInfo()
-                    } else {
-                        if (_connectedPeers.value.isNotEmpty()) {
-                            _state.value = TransportState.DISCONNECTED
-                        } else if (_state.value == TransportState.CONNECTING) {
+                    if (p2pState == WifiP2pManager.WIFI_P2P_STATE_ENABLED) {
+                        log("Wi-Fi Direct enabled")
+                        if (handledGroupKey == null) {
                             _state.value = TransportState.SCANNING
+                            startPeerDiscovery()
                         }
-                        _connectedPeers.value = emptyList()
-                        groupOwnerAddress = null
-                        connectedClientIps.clear()
-                        pendingConnectMac = null
-                        // Resume scanning so peers reappear in UI after disconnect
-                        startPeerDiscovery()
+                    } else {
+                        log("Wi-Fi Direct disabled")
+                        _state.value = TransportState.ERROR
+                        notice("p2p-off", "Wi-Fi is off. Wi-Fi Direct needs Wi-Fi turned on.", 60_000)
                     }
                 }
+
+                WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> requestPeers()
+
+                // The monitor below polls as well, because Android often withholds this broadcast
+                // from background apps. A "disconnected" report is only meaningful if we had a group:
+                // during negotiation it is normal noise, and reacting to it (for example by restarting
+                // discovery) can break the connection that is being set up.
+                WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> checkConnectionState()
             }
         }
     }
 
-    override fun isAvailable(): Boolean {
-        return wifiP2pManager != null
-    }
+    override fun isAvailable(): Boolean = wifiP2pManager != null
 
     override suspend fun start() = withContext(Dispatchers.IO) {
         if (started) return@withContext
@@ -191,11 +213,8 @@ class WifiEngine(
             addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
             addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
         }
-
         if (!isReceiverRegistered) {
-            ContextCompat.registerReceiver(
-                context, p2pReceiver, intentFilter, ContextCompat.RECEIVER_NOT_EXPORTED
-            )
+            ContextCompat.registerReceiver(context, p2pReceiver, intentFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
             isReceiverRegistered = true
         }
 
@@ -203,57 +222,15 @@ class WifiEngine(
         startPeerDiscovery()
         startServerSocket()
         startConnectionMonitor()
-    }
-
-    private var connectionMonitorJob: Job? = null
-
-    /**
-     * Active polling monitor for Wi-Fi Direct connection state.
-     * Android often drops or denies broadcast intents for WIFI_P2P_CONNECTION_CHANGED
-     * due to background appop/location restrictions. This ensures group formation
-     * is promptly and reliably detected regardless of broadcast delivery.
-     */
-    private fun startConnectionMonitor() {
-        connectionMonitorJob?.cancel()
-        connectionMonitorJob = scope.launch(Dispatchers.IO) {
-            while (isActive) {
-                // Poll connection info periodically: faster during CONNECTING, moderate otherwise
-                val pollDelay = if (_state.value == TransportState.CONNECTING) 1500L else 5000L
-                delay(pollDelay)
-                checkConnectionState()
-            }
-        }
-    }
-
-    private fun checkConnectionState() {
-        val p2p = wifiP2pManager ?: return
-        val ch = channel ?: return
-        p2p.requestConnectionInfo(ch) { info: WifiP2pInfo? ->
-            if (info != null && info.groupFormed) {
-                if (_state.value != TransportState.CONNECTED || groupOwnerAddress == null) {
-                    Log.d(TAG, "Connection monitor detected formed group: GO=${info.groupOwnerAddress?.hostAddress}, isGO=${info.isGroupOwner}")
-                    handleGroupFormed(info)
-                }
-            } else if (_state.value == TransportState.CONNECTED) {
-                Log.d(TAG, "Connection monitor detected group teardown")
-                handleGroupDisconnected()
-            }
-        }
-    }
-
-    private fun handleGroupDisconnected() {
-        _state.value = TransportState.DISCONNECTED
-        _connectedPeers.value = emptyList()
-        groupOwnerAddress = null
-        connectedClientIps.clear()
-        pendingConnectMac = null
-        startPeerDiscovery()
+        log("Wi-Fi Direct started")
     }
 
     override suspend fun stop() = withContext(Dispatchers.IO) {
         started = false
         connectionMonitorJob?.cancel()
         connectionMonitorJob = null
+        connectTimeoutJob?.cancel()
+        helloJob?.cancel()
 
         if (isReceiverRegistered) {
             try {
@@ -276,6 +253,7 @@ class WifiEngine(
         val ch = channel
         if (p2p != null && ch != null) {
             p2p.stopPeerDiscovery(ch, null)
+            p2p.cancelConnect(ch, null)
             p2p.removeGroup(ch, null)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
                 try {
@@ -287,25 +265,47 @@ class WifiEngine(
         }
         channel = null
 
+        resetGroupState()
         _discoveredPeers.value = emptyList()
-        _connectedPeers.value = emptyList()
-        connectedClientIps.clear()
-        groupOwnerAddress = null
-        pendingConnectMac = null
         _state.value = TransportState.IDLE
+        log("Wi-Fi Direct stopped")
     }
 
-    fun startPeerDiscovery() {
+    /** Call after the pairing code changed: introduce ourselves again right away. */
+    fun onPairingChanged() {
+        val go = groupOwnerAddress
+        if (!isGroupOwner && go != null) {
+            scope.launch(Dispatchers.IO) { sendHelloOnce(go) }
+        }
+    }
+
+    // ---------------------------------------------------------------- discovery
+
+    fun startPeerDiscovery(retryIfBusy: Boolean = true) {
         val p2p = wifiP2pManager ?: return
         val ch = channel ?: return
+        lastDiscoveryAt = System.currentTimeMillis()
 
         p2p.discoverPeers(ch, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                Log.d(TAG, "Wi-Fi Direct peer discovery started successfully")
+                log("Looking for nearby devices")
             }
 
             override fun onFailure(reason: Int) {
-                Log.e(TAG, "Wi-Fi Direct peer discovery failed: $reason")
+                log("Discovery failed: ${reasonText(reason)}")
+                if (reason == WifiP2pManager.BUSY && retryIfBusy) {
+                    scope.launch(Dispatchers.IO) {
+                        delay(3000)
+                        if (started && handledGroupKey == null) startPeerDiscovery(retryIfBusy = false)
+                    }
+                } else if (reason == WifiP2pManager.ERROR || reason == WifiP2pManager.P2P_UNSUPPORTED) {
+                    notice(
+                        "discovery",
+                        "Wi-Fi Direct couldn't search for devices (${reasonText(reason)}). " +
+                            "Check that Wi-Fi is on" +
+                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) " and Location is enabled." else "."
+                    )
+                }
             }
         })
     }
@@ -322,7 +322,8 @@ class WifiEngine(
                     list.add(
                         PeerDevice(
                             id = device.deviceAddress,
-                            name = device.deviceName?.takeIf { it.isNotBlank() } ?: "Android (${device.deviceAddress.takeLast(5)})",
+                            name = device.deviceName?.takeIf { it.isNotBlank() }
+                                ?: "Android (${device.deviceAddress.takeLast(5)})",
                             transportType = TransportType.WIFI_DIRECT_SOCKET,
                             isConnected = device.status == WifiP2pDevice.CONNECTED
                         )
@@ -330,43 +331,39 @@ class WifiEngine(
                 }
             }
             _discoveredPeers.value = list
-            Log.d(TAG, "Discovered ${list.size} eligible Wi-Fi Direct peers")
         }
     }
 
-    /**
-     * Only phones/tablets/computers can run RadioClip. Wi-Fi Direct reports a "primary device type"
-     * such as "10-0050F204-5" (category 10 = telephone, 1 = computer); TVs, printers, speakers etc.
-     * use other categories. Devices that report no type are kept so nothing is hidden by mistake.
-     * (Matching on device *names* is unreliable: a phone called "Samsung Galaxy" is not a TV.)
-     */
-    private fun isEligiblePeer(device: WifiP2pDevice): Boolean {
-        val type = device.primaryDeviceType?.trim().orEmpty()
-        if (type.isEmpty()) return true
-        return type.startsWith("10-") || type.startsWith("1-")
+    /** By default every nearby Wi-Fi Direct device is listed; the setting can hide TVs, printers, speakers... */
+    private fun isEligiblePeer(device: WifiP2pDevice): Boolean =
+        settingsProvider().wifiShowAll || WifiDeviceTypes.isPhoneLike(device.primaryDeviceType)
+
+    private fun reasonText(reason: Int): String = when (reason) {
+        WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct is not supported"
+        WifiP2pManager.BUSY -> "the Wi-Fi system is busy"
+        WifiP2pManager.ERROR -> "system error"
+        WifiP2pManager.NO_SERVICE_REQUESTS -> "no service requests"
+        else -> "code $reason"
     }
 
+    // ---------------------------------------------------------------- connecting
+
     override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.IO) {
-        suspendCoroutine { cont ->
-            val p2p = wifiP2pManager
-            val ch = channel
-            if (p2p == null || ch == null) {
-                cont.resume(Result.failure(IllegalStateException("WifiP2pManager not initialized")))
-                return@suspendCoroutine
-            }
+        val p2p = wifiP2pManager
+        val ch = channel
+        if (p2p == null || ch == null) {
+            return@withContext Result.failure(IllegalStateException("Wi-Fi Direct is not running"))
+        }
 
-            _state.value = TransportState.CONNECTING
-            pendingConnectMac = peerId // Track MAC address for UI peer ID matching
+        _state.value = TransportState.CONNECTING
+        pendingConnectMac = peerId
+        log("Connecting to ${DiagLog.mask(peerId)}")
 
-            // Cancel discovery first to let Android Wi-Fi Direct negotiate the P2P group
+        suspendCoroutine<Result<Unit>> { cont ->
+            // Stop discovery first: Android negotiates the group more reliably without it.
             p2p.stopPeerDiscovery(ch, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    initiateGroupConnect(p2p, ch, peerId, cont)
-                }
-
-                override fun onFailure(reason: Int) {
-                    initiateGroupConnect(p2p, ch, peerId, cont)
-                }
+                override fun onSuccess() = initiateGroupConnect(p2p, ch, peerId, cont, retryIfBusy = true)
+                override fun onFailure(reason: Int) = initiateGroupConnect(p2p, ch, peerId, cont, retryIfBusy = true)
             })
         }
     }
@@ -375,205 +372,301 @@ class WifiEngine(
         p2p: WifiP2pManager,
         ch: WifiP2pManager.Channel,
         peerId: String,
-        cont: kotlin.coroutines.Continuation<Result<Unit>>
+        cont: Continuation<Result<Unit>>,
+        retryIfBusy: Boolean
     ) {
         val config = WifiP2pConfig().apply {
-            this.deviceAddress = peerId
-            // Use standard PBC (Push Button Configuration) for peer-to-peer pairing without PIN
-            wps.setup = android.net.wifi.WpsInfo.PBC
+            deviceAddress = peerId
+            // Push Button Configuration: the other phone only has to tap "Accept".
+            wps.setup = WpsInfo.PBC
         }
 
         p2p.connect(ch, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                Log.d(TAG, "Wi-Fi Direct connect initiation to $peerId succeeded")
+                log("Connection request sent")
+                notice("request-sent", "Request sent. Tap Accept on the other phone.", 5_000)
+                scheduleRequestTimeout()
                 cont.resume(Result.success(Unit))
             }
 
             override fun onFailure(reason: Int) {
-                Log.e(TAG, "Wi-Fi Direct connect initiation to $peerId failed: $reason")
-                _state.value = TransportState.SCANNING
-                cont.resume(Result.failure(Exception("Wi-Fi Direct connect failed code: $reason")))
+                if (reason == WifiP2pManager.BUSY && retryIfBusy) {
+                    // A leftover group or half-finished attempt is in the way: clear it and try once more.
+                    log("Wi-Fi Direct busy, clearing old state and retrying")
+                    p2p.cancelConnect(ch, null)
+                    p2p.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() = retryLater()
+                        override fun onFailure(reason: Int) = retryLater()
+
+                        private fun retryLater() {
+                            scope.launch(Dispatchers.IO) {
+                                delay(1000)
+                                initiateGroupConnect(p2p, ch, peerId, cont, retryIfBusy = false)
+                            }
+                        }
+                    })
+                } else {
+                    log("Connect failed: ${reasonText(reason)}")
+                    pendingConnectMac = null
+                    _state.value = TransportState.SCANNING
+                    startPeerDiscovery()
+                    cont.resume(Result.failure(IOException("Wi-Fi Direct connect failed: ${reasonText(reason)}")))
+                }
             }
         })
     }
 
-    private fun requestConnectionInfo() {
+    private fun scheduleRequestTimeout() {
+        connectTimeoutJob?.cancel()
+        connectTimeoutJob = scope.launch(Dispatchers.IO) {
+            delay(REQUEST_ACCEPT_TIMEOUT_MS)
+            if (started && handledGroupKey == null && _state.value == TransportState.CONNECTING) {
+                log("Nobody accepted the request in time")
+                val p2p = wifiP2pManager
+                val ch = channel
+                if (p2p != null && ch != null) p2p.cancelConnect(ch, null)
+                pendingConnectMac = null
+                _state.value = TransportState.SCANNING
+                onNotice("The other phone didn't accept in time. Open RadioClip there, try again, and tap Accept.")
+                startPeerDiscovery()
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- group state
+
+    /** Polls the connection: Android doesn't always deliver the broadcasts to background apps. */
+    private fun startConnectionMonitor() {
+        connectionMonitorJob?.cancel()
+        connectionMonitorJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(if (_state.value == TransportState.CONNECTING) 1500L else 5000L)
+                checkConnectionState()
+                pruneSilentClients()
+                refreshDiscoveryIfStale()
+            }
+        }
+    }
+
+    private fun checkConnectionState() {
         val p2p = wifiP2pManager ?: return
         val ch = channel ?: return
         p2p.requestConnectionInfo(ch) { info: WifiP2pInfo? ->
             if (info != null && info.groupFormed) {
                 handleGroupFormed(info)
+            } else if (handledGroupKey != null) {
+                log("Group ended")
+                handleGroupDisconnected()
             }
         }
+    }
+
+    /** Android ends discovery by itself after about two minutes; start it again while nobody is connected. */
+    private fun refreshDiscoveryIfStale() {
+        if (handledGroupKey != null || _state.value == TransportState.CONNECTING || !started) return
+        if (System.currentTimeMillis() - lastDiscoveryAt > DISCOVERY_REFRESH_MS) startPeerDiscovery()
     }
 
     private fun handleGroupFormed(info: WifiP2pInfo) {
-        isGroupOwner = info.isGroupOwner
+        val owner = info.isGroupOwner
         val goAddress = info.groupOwnerAddress?.hostAddress
+        val key = "$owner/$goAddress"
+        if (key == handledGroupKey) return
+        handledGroupKey = key
+
+        isGroupOwner = owner
         groupOwnerAddress = goAddress
-        _state.value = TransportState.CONNECTED
-        Log.d(TAG, "P2P Group Formed: isGroupOwner=$isGroupOwner, Owner IP=$goAddress")
+        connectTimeoutJob?.cancel()
+        log("Group formed: we are the ${if (owner) "group owner" else "client"}, owner ip ${goAddress ?: "?"}")
 
-        val peers = mutableListOf<PeerDevice>()
-        val connectedMac = pendingConnectMac
-
-        if (!isGroupOwner && connectedMac != null) {
-            val device = discoveredDevices[connectedMac]
-            val peerName = device?.deviceName?.takeIf { it.isNotBlank() }
-                ?: "Wi-Fi Direct GO ($goAddress)"
-            peers.add(PeerDevice(
-                id = connectedMac,
-                name = peerName,
-                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                isConnected = true
-            ))
-            val existing = _discoveredPeers.value.toMutableList()
-            val idx = existing.indexOfFirst { it.id == connectedMac }
-            if (idx < 0) {
-                existing.add(PeerDevice(id = connectedMac, name = peerName,
-                    transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
-            } else {
-                existing[idx] = existing[idx].copy(isConnected = true)
-            }
-            _discoveredPeers.value = existing
-            sendHelloToGroupOwner(goAddress)
-        } else if (isGroupOwner) {
-            peers.add(PeerDevice(
-                id = goAddress ?: "p2p_group",
-                name = "Group Owner (GO: $goAddress)",
-                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                isConnected = true
-            ))
-            connectedClientIps.forEach { clientIp ->
-                peers.add(PeerDevice(id = clientIp, name = "Client ($clientIp)",
-                    transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
-            }
-        }
-
-        _connectedPeers.value = peers
         startServerSocket()
-    }
 
-    /**
-     * Sends a minimal, encrypted hello to the Group Owner right after joining the P2P group.
-     * The GO registers our IP address once the hello authenticates, which it needs to send data
-     * back to this client.
-     */
-    private fun sendHelloToGroupOwner(goAddress: String?) {
-        if (goAddress.isNullOrBlank()) return
-        scope.launch(Dispatchers.IO) {
-            val key = keyProvider()
-            if (key == null) {
-                Log.w(TAG, "Not paired yet: skipping hello to Group Owner")
-                return@launch
-            }
-            try {
-                delay(1500) // Brief wait for DHCP/routing to be fully ready
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress(goAddress, PORT), CONNECT_TIMEOUT_MS)
-                    socket.soTimeout = IO_TIMEOUT_MS
-                    val output = DataOutputStream(SecureOutputStream(socket.getOutputStream(), key))
-                    output.writeByte(TYPE_HELLO.toInt())
-                    output.writeUTF(java.util.UUID.randomUUID().toString())
-                    output.writeLong(System.currentTimeMillis())
-                    output.flush()
-                }
-                Log.d(TAG, "Peer hello sent to Group Owner: $goAddress")
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.w(TAG, "Peer hello to GO failed (non-critical): ${e.message}")
-            }
-        }
-    }
-
-    private fun startServerSocket() {
-        if (serverSocket != null && serverSocket?.isClosed == false) return
-
-        serverJob?.cancel()
-        serverJob = scope.launch(Dispatchers.IO) {
-            try {
-                val server = ServerSocket().apply {
-                    reuseAddress = true
-                    bind(InetSocketAddress(PORT))
-                }
-                serverSocket = server
-                Log.d(TAG, "ServerSocket listening on port $PORT (isGO=$isGroupOwner)")
-
-                while (isActive) {
-                    val socket = server.accept()
-                    if (!connectionLimiter.tryAcquire()) {
-                        Log.w(TAG, "Too many simultaneous connections, dropping one")
-                        runCatching { socket.close() }
-                        continue
-                    }
-                    launch(Dispatchers.IO) {
-                        try {
-                            handleIncomingConnection(socket)
-                        } finally {
-                            connectionLimiter.release()
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                if (isActive) {
-                    Log.e(TAG, "ServerSocket error", e)
-                }
-            }
-        }
-    }
-
-    private fun updateConnectedPeersList() {
-        val goAddress = groupOwnerAddress ?: "p2p_group"
-        val goId = if (isGroupOwner) goAddress else (pendingConnectMac ?: goAddress)
-        val ownerLabel = if (isGroupOwner) "Group Owner (GO: $goAddress)" else "Connected (GO: $goAddress)"
-        val list = mutableListOf(
-            PeerDevice(
-                id = goId,
-                name = ownerLabel,
+        if (owner) {
+            // Clients register themselves with a hello; until one does there is nobody to talk to.
+            _state.value = if (connectedClientIps.isEmpty()) TransportState.CONNECTING else TransportState.CONNECTED
+            updateConnectedPeersList()
+        } else {
+            // This is the case that used to be missed when the OTHER phone started the connection.
+            _state.value = TransportState.CONNECTED
+            ownerPeer = PeerDevice(
+                id = pendingConnectMac ?: goAddress ?: "p2p_group",
+                name = "Wi-Fi Direct device",
                 transportType = TransportType.WIFI_DIRECT_SOCKET,
                 isConnected = true
             )
-        )
-        connectedClientIps.forEach { clientIp ->
-            list.add(PeerDevice(
-                id = clientIp,
-                name = "Client ($clientIp)",
+            updateConnectedPeersList()
+            resolveGroupOwner(goAddress)
+            startHelloLoop(goAddress)
+        }
+    }
+
+    /** Looks up the name and address of the phone that owns the group we joined. */
+    private fun resolveGroupOwner(goAddress: String?) {
+        val p2p = wifiP2pManager ?: return
+        val ch = channel ?: return
+        p2p.requestGroupInfo(ch) { group: WifiP2pGroup? ->
+            val device = group?.owner ?: return@requestGroupInfo
+            ownerPeer = PeerDevice(
+                id = device.deviceAddress?.takeIf { it.isNotBlank() } ?: pendingConnectMac ?: goAddress ?: "p2p_group",
+                name = device.deviceName?.takeIf { it.isNotBlank() } ?: "Wi-Fi Direct device",
                 transportType = TransportType.WIFI_DIRECT_SOCKET,
                 isConnected = true
-            ))
+            )
+            updateConnectedPeersList()
+        }
+    }
+
+    private fun handleGroupDisconnected() {
+        resetGroupState()
+        if (started) {
+            _state.value = TransportState.SCANNING
+            startPeerDiscovery()
+        }
+    }
+
+    private fun resetGroupState() {
+        handledGroupKey = null
+        helloJob?.cancel()
+        helloJob = null
+        groupOwnerAddress = null
+        isGroupOwner = false
+        ownerPeer = null
+        pendingConnectMac = null
+        connectedClientIps.clear()
+        clientNames.clear()
+        _connectedPeers.value = emptyList()
+    }
+
+    private fun updateConnectedPeersList() {
+        val list = mutableListOf<PeerDevice>()
+        if (isGroupOwner) {
+            connectedClientIps.keys.forEach { ip ->
+                list.add(
+                    PeerDevice(
+                        id = ip,
+                        name = clientNames[ip] ?: "Client ($ip)",
+                        transportType = TransportType.WIFI_DIRECT_SOCKET,
+                        isConnected = true
+                    )
+                )
+            }
+            _state.value = if (list.isEmpty()) TransportState.CONNECTING else TransportState.CONNECTED
+        } else {
+            ownerPeer?.let { list.add(it) }
         }
         _connectedPeers.value = list
+    }
 
-        // For GO: also add clients into discoveredPeers so they show in the UI list
-        if (isGroupOwner && connectedClientIps.isNotEmpty()) {
-            val existing = _discoveredPeers.value.toMutableList()
-            connectedClientIps.forEach { clientIp ->
-                if (existing.none { it.id == clientIp }) {
-                    existing.add(PeerDevice(id = clientIp, name = "Client ($clientIp)",
-                        transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
+    /** GO side: forget clients that stopped sending heartbeats (phone walked away, Wi-Fi turned off...). */
+    private fun pruneSilentClients() {
+        if (!isGroupOwner || handledGroupKey == null) return
+        val now = System.currentTimeMillis()
+        val gone = connectedClientIps.filterValues { now - it > CLIENT_TIMEOUT_MS }.keys
+        if (gone.isEmpty()) return
+        gone.forEach {
+            connectedClientIps.remove(it)
+            clientNames.remove(it)
+            log("Client ${DiagLog.mask(it)} went silent")
+        }
+        updateConnectedPeersList()
+    }
+
+    // ---------------------------------------------------------------- hello (client -> group owner)
+
+    private fun startHelloLoop(goAddress: String?) {
+        helloJob?.cancel()
+        if (goAddress.isNullOrBlank()) return
+        helloJob = scope.launch(Dispatchers.IO) {
+            delay(1000) // let DHCP/routing settle
+            var failures = 0
+            while (isActive) {
+                if (sendHelloOnce(goAddress)) {
+                    failures = 0
+                    delay(HELLO_INTERVAL_MS)
+                } else {
+                    failures++
+                    delay((2000L * failures).coerceAtMost(10_000L))
                 }
             }
-            _discoveredPeers.value = existing
+        }
+    }
+
+    /** Sends one encrypted hello (our name and Wi-Fi Direct address) to the group owner. */
+    private fun sendHelloOnce(goAddress: String): Boolean {
+        val key = keyProvider() ?: return false   // not paired yet; the loop retries
+        return try {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(goAddress, PORT), CONNECT_TIMEOUT_MS)
+                socket.soTimeout = IO_TIMEOUT_MS
+                val output = DataOutputStream(SecureOutputStream(socket.getOutputStream(), key))
+                output.writeByte(TYPE_HELLO.toInt())
+                output.writeUTF(UUID.randomUUID().toString())
+                output.writeLong(System.currentTimeMillis())
+                output.writeUTF(settingsProvider().announcedName(Build.MODEL ?: "Android"))
+                output.flush()
+            }
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("Hello to group owner failed: ${e.message}")
+            false
+        }
+    }
+
+    // ---------------------------------------------------------------- receiving
+
+    private fun startServerSocket() {
+        if (serverJob?.isActive == true) return
+
+        serverJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                try {
+                    val server = ServerSocket().apply {
+                        reuseAddress = true
+                        bind(InetSocketAddress(PORT))
+                    }
+                    serverSocket = server
+                    log("Listening on port $PORT")
+
+                    while (isActive) {
+                        val socket = server.accept()
+                        if (!connectionLimiter.tryAcquire()) {
+                            log("Too many simultaneous connections, dropping one")
+                            runCatching { socket.close() }
+                            continue
+                        }
+                        launch(Dispatchers.IO) {
+                            try {
+                                handleIncomingConnection(socket)
+                            } finally {
+                                connectionLimiter.release()
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (!isActive) return@launch
+                    // For example the port is still held by a previous run: wait and try again.
+                    log("Server socket error: ${e.message}")
+                    runCatching { serverSocket?.close() }
+                    serverSocket = null
+                    delay(2000)
+                }
+            }
         }
     }
 
     private fun senderNameFor(clientIp: String?): String {
-        if (isGroupOwner) return "Client ($clientIp)"
-        val mac = pendingConnectMac
-        val name = if (mac != null) discoveredDevices[mac]?.deviceName else null
-        return name?.takeIf { it.isNotBlank() } ?: "Group Owner ($clientIp)"
+        if (isGroupOwner) return clientNames[clientIp] ?: "Client ($clientIp)"
+        return ownerPeer?.name ?: "Group owner ($clientIp)"
     }
-
-    private fun receivedFilesDir(): File =
-        (context.getExternalFilesDir("received") ?: File(context.filesDir, "received")).apply { mkdirs() }
 
     private suspend fun handleIncomingConnection(socket: Socket) = withContext(Dispatchers.IO) {
         socket.use { s ->
             try {
                 val key = keyProvider()
                 if (key == null) {
-                    Log.w(TAG, "Dropping incoming connection: not paired")
+                    log("Dropped a connection: this device is not paired")
                     return@use
                 }
                 s.soTimeout = IO_TIMEOUT_MS
@@ -584,15 +677,22 @@ class WifiEngine(
                 val payloadId = input.readUTF()
                 val timestamp = input.readLong()
 
+                // Only authenticated peers count as clients.
                 val clientIp = s.inetAddress?.hostAddress
-                if (clientIp != null && isGroupOwner && connectedClientIps.add(clientIp)) {
-                    updateConnectedPeersList()
+                if (isGroupOwner && clientIp != null) {
+                    val isNew = connectedClientIps.put(clientIp, System.currentTimeMillis()) == null
+                    if (isNew) {
+                        log("Client ${DiagLog.mask(clientIp)} joined")
+                        updateConnectedPeersList()
+                    }
                 }
-                val senderName = senderNameFor(clientIp)
 
                 when (wireType) {
                     TYPE_HELLO -> {
-                        Log.d(TAG, "Received peer hello from $clientIp - IP registered")
+                        val name = BleMessages.cleanName(input.readUTF())
+                        if (isGroupOwner && clientIp != null && name.isNotEmpty() && clientNames.put(clientIp, name) != name) {
+                            updateConnectedPeersList()
+                        }
                     }
 
                     TYPE_TEXT -> {
@@ -600,19 +700,18 @@ class WifiEngine(
                         require(length in 0..MAX_TEXT_BYTES) { "Text payload size out of range: $length" }
                         val bytes = ByteArray(length)
                         input.readFully(bytes)
-                        val text = String(bytes, Charsets.UTF_8)
 
                         _incomingPayloads.emit(
                             Payload.Text(
                                 id = payloadId,
                                 timestamp = timestamp,
                                 transportType = TransportType.WIFI_DIRECT_SOCKET,
-                                senderDeviceName = senderName,
+                                senderDeviceName = senderNameFor(clientIp),
                                 isOutgoing = false,
-                                content = text
+                                content = String(bytes, Charsets.UTF_8)
                             )
                         )
-                        Log.d(TAG, "Received text via Wi-Fi socket from $senderName (${bytes.size} bytes)")
+                        log("Received text (${bytes.size} bytes)")
                     }
 
                     TYPE_FILE -> {
@@ -621,7 +720,7 @@ class WifiEngine(
                         val fileSize = input.readLong()
 
                         require(fileSize in 0..MAX_FILE_BYTES) { "File size out of range: $fileSize" }
-                        val dir = receivedFilesDir()
+                        val dir = AppFiles.receivedDir(context)
                         require(dir.usableSpace > fileSize + MIN_FREE_SPACE_BYTES) { "Not enough free space for $fileSize bytes" }
 
                         // The name comes from another device: sanitize it and never overwrite a file.
@@ -648,7 +747,7 @@ class WifiEngine(
                                 id = payloadId,
                                 timestamp = timestamp,
                                 transportType = TransportType.WIFI_DIRECT_SOCKET,
-                                senderDeviceName = senderName,
+                                senderDeviceName = senderNameFor(clientIp),
                                 isOutgoing = false,
                                 fileName = targetFile.name,
                                 mimeType = mimeType,
@@ -656,18 +755,26 @@ class WifiEngine(
                                 localPath = targetFile.absolutePath
                             )
                         )
-                        Log.d(TAG, "Received file via Wi-Fi socket from $senderName: ${targetFile.name} ($fileSize bytes)")
+                        log("Received file ${targetFile.name} ($fileSize bytes)")
                     }
 
-                    else -> Log.w(TAG, "Unknown wire type $wireType from $clientIp")
+                    else -> log("Unknown message type $wireType")
                 }
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: FrameAuthenticationException) {
+                log("A device connected but its data couldn't be verified (different pairing code?)")
+                notice(
+                    "auth",
+                    "A nearby device sent data that couldn't be verified. Check that both devices use the same pairing code."
+                )
             } catch (e: Exception) {
-                Log.w(TAG, "Error handling incoming socket connection: ${e.message}")
+                log("Error handling incoming connection: ${e.message}")
             }
         }
     }
+
+    // ---------------------------------------------------------------- sending
 
     /** A file ready to stream: its exact size and a way to open it. */
     private class PreparedFile(val size: Long, val open: () -> InputStream)
@@ -706,15 +813,15 @@ class WifiEngine(
     }
 
     override suspend fun send(payload: Payload, targetPeerId: String?): Result<Unit> = withContext(Dispatchers.IO) {
-        runCatching {
+        try {
             val key = keyProvider() ?: error("Not paired: enter the same pairing code on both devices first")
 
             val destinations: List<String> = when {
                 targetPeerId != null && targetPeerId.contains(".") -> listOf(targetPeerId)
                 !isGroupOwner && !groupOwnerAddress.isNullOrBlank() -> listOf(groupOwnerAddress!!)
                 // Group owner: deliver to every client, not just the first one.
-                isGroupOwner && connectedClientIps.isNotEmpty() -> connectedClientIps.toList()
-                else -> error("Destination IP unknown. No P2P group formed or client IP recorded.")
+                isGroupOwner && connectedClientIps.isNotEmpty() -> connectedClientIps.keys.toList()
+                else -> error("No device is connected over Wi-Fi Direct yet")
             }
 
             val prepared = if (payload is Payload.File) prepareFile(payload) else null
@@ -728,17 +835,20 @@ class WifiEngine(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    Log.w(TAG, "Send to $ip failed: ${e.message}")
+                    log("Send to ${DiagLog.mask(ip)} failed: ${e.message}")
                     lastError = e
                 }
             }
             if (delivered == 0) throw (lastError ?: IllegalStateException("Nothing was sent"))
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
         }
     }
 
     private fun sendTo(ip: String, payload: Payload, prepared: PreparedFile?, key: ByteArray) {
-        Log.d(TAG, "Connecting TCP socket to $ip:$PORT to send ${payload.javaClass.simpleName}")
-
         Socket().use { socket ->
             socket.connect(InetSocketAddress(ip, PORT), CONNECT_TIMEOUT_MS)
             socket.soTimeout = IO_TIMEOUT_MS
@@ -778,7 +888,6 @@ class WifiEngine(
                     output.flush()
                 }
             }
-            Log.d(TAG, "Successfully sent payload to $ip")
         }
     }
 }

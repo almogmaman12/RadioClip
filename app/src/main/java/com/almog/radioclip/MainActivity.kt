@@ -1,12 +1,9 @@
 package com.almog.radioclip
 
-import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.widget.Toast
@@ -21,7 +18,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.core.content.ContextCompat
+import androidx.activity.compose.BackHandler
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import com.almog.radioclip.settings.SettingsStore
+import com.almog.radioclip.ui.SettingsScreen
+import com.almog.radioclip.util.AppPermissions
+import com.almog.radioclip.util.SystemChecks
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.TransportState
 import com.almog.radioclip.service.RadioSyncService
@@ -48,11 +53,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private var triggerFilePicker by mutableStateOf(false)
+    private var showSettings by mutableStateOf(false)
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
+        if (intent.action == RadioSyncService.ACTION_SEND_FILE_FROM_NOTIFICATION) {
             triggerFilePicker = true
         }
     }
@@ -61,7 +67,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        if (intent?.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
+        if (intent?.action == RadioSyncService.ACTION_SEND_FILE_FROM_NOTIFICATION) {
             triggerFilePicker = true
         }
 
@@ -135,8 +141,41 @@ class MainActivity : ComponentActivity() {
                 val connectedWifiPeers = currentService?.wifiEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
                 val history = currentService?.history?.collectAsState()?.value ?: emptyList()
                 val isPaired = currentService?.pairing?.isPaired?.collectAsState()?.value ?: false
+                val settingsStore = remember { SettingsStore.get(applicationContext) }
+                val settings = settingsStore.settings.collectAsState().value
 
-                DashboardScreen(
+                // Re-check Bluetooth/Wi-Fi/permissions whenever the screen comes back or the radios change state.
+                var resumeTick by remember { mutableStateOf(0) }
+                val lifecycleOwner = LocalLifecycleOwner.current
+                DisposableEffect(lifecycleOwner) {
+                    val observer = LifecycleEventObserver { _, event ->
+                        if (event == Lifecycle.Event.ON_RESUME) resumeTick++
+                    }
+                    lifecycleOwner.lifecycle.addObserver(observer)
+                    onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+                }
+                val requestPermissions = {
+                    checkAndRequestPermissions { missing ->
+                        if (missing.isNotEmpty()) permissionLauncher.launch(missing.toTypedArray())
+                    }
+                }
+                val systemIssues = remember(resumeTick, bleState, wifiState, settings.useWifiDirect) {
+                    SystemChecks.issues(this@MainActivity, settings.useWifiDirect, requestPermissions)
+                }
+
+                BackHandler(enabled = showSettings) { showSettings = false }
+
+                if (showSettings) {
+                    SettingsScreen(
+                        settings = settings,
+                        isPaired = isPaired,
+                        onChange = { transform -> settingsStore.update(transform) },
+                        onBack = { showSettings = false },
+                        onChangePairing = { showSettings = false },
+                        onRemovePairing = { currentService?.clearPairing() },
+                        onCopyText = { currentService?.copyToClipboard(it) }
+                    )
+                } else DashboardScreen(
                     isPaired = isPaired,
                     onSetPairingCode = { code -> currentService?.setPairingCode(code) },
                     onClearPairing = { currentService?.clearPairing() },
@@ -163,15 +202,27 @@ class MainActivity : ComponentActivity() {
                             )
                         )
                     },
-                    onRequestPermissions = {
-                        checkAndRequestPermissions { permissionsToRequest ->
-                            if (permissionsToRequest.isNotEmpty()) {
-                                permissionLauncher.launch(permissionsToRequest.toTypedArray())
-                            }
-                        }
-                    }
+                    systemIssues = systemIssues,
+                    wifiEnabled = settings.useWifiDirect,
+                    onRescanBle = { currentService?.rescanBluetooth() },
+                    onRescanWifi = { currentService?.rescanWifi() },
+                    onSendClipboard = { sendClipboardNow(currentService) },
+                    onCopyText = { currentService?.copyToClipboard(it) },
+                    onClearHistory = { currentService?.clearHistory() },
+                    onOpenSettings = { showSettings = true }
                 )
             }
+        }
+    }
+
+    /** The app is on screen here, so Android allows reading the clipboard. */
+    private fun sendClipboardNow(service: RadioSyncService?) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val text = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+        if (text.isNullOrBlank()) {
+            Toast.makeText(this, "The clipboard is empty", Toast.LENGTH_SHORT).show()
+        } else {
+            service?.sendPayload(Payload.Text(content = text, isOutgoing = true))
         }
     }
 
@@ -198,25 +249,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkAndRequestPermissions(onReady: (List<String>) -> Unit) {
-        val requiredPermissions = mutableListOf<String>()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            requiredPermissions.add(Manifest.permission.BLUETOOTH_SCAN)
-            requiredPermissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            requiredPermissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            requiredPermissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-            requiredPermissions.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
-        requiredPermissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
-
-        val missing = requiredPermissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        onReady(missing)
+        onReady(AppPermissions.missing(this))
     }
 }

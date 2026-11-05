@@ -68,7 +68,8 @@ class SecureStreamsTest {
         try {
             reader(wire, Crypto.deriveKey("a different code")).readUTF()
             fail("expected authentication failure")
-        } catch (expected: IOException) {
+        } catch (expected: FrameAuthenticationException) {
+            // a wrong code must be distinguishable from ordinary network errors
         }
     }
 

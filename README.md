@@ -56,9 +56,40 @@ What this does **not** protect against: someone who learns the code can read eve
 
 ---
 
+## ⚙️ Settings & Everyday Use
+
+Open **Settings** from the dashboard:
+
+- **Clipboard**: send automatically or not, apply received text automatically or show a notification with a **Copy** button, skip passwords (text Android marks as sensitive), hide received text in Android's clipboard preview, notify when text arrives.
+- **Bluetooth speed**: Battery saver / Balanced / Fastest.
+- **Wi-Fi Direct**: turn it off for Bluetooth-only text sync, or hide non-phone devices (TVs, printers).
+- **Files**: auto-delete received files after 1, 7 or 30 days; start after reboot; shortcut to battery-optimization settings.
+- **Diagnostics**: a live log (never contains clipboard text) with Copy / Share, useful when connecting fails.
+
+Other ways to send:
+- **Share menu**: share text, links or files from any app and pick "Send with RadioClip".
+- **Notification buttons**: "Send clipboard" and "Send file" on the ongoing notification.
+- **Dashboard**: the "Clipboard" and "File" buttons.
+
+The dashboard also shows what is wrong on the phone (Bluetooth or Wi-Fi off, missing permissions, Location off on Android 12 and older) with a button to fix it.
+
+### Bluetooth improvements
+- Advertisements carry a short pairing-code tag, so devices with a different code are ignored and only your devices connect.
+- Only one of two phones opens the link, avoiding duplicate or crossed connections.
+- Devices exchange their names, shown with a signal-strength label.
+- Chunks are sent with acknowledgements, so large text arrives intact and in order; automatic reconnection with backoff; scan throttling handled; Bluetooth turning off and on is handled.
+
+### Wi-Fi Direct pairing fix
+Both the group-owner and client roles now announce themselves and are tracked; discovery is refreshed periodically; the app shows a message when a connection request is not accepted within 45 seconds or when the pairing codes don't match.
+
+> [!NOTE]
+> The wire protocols changed. **All devices need this version and the same pairing code.**
+
+---
+
 ## ⚠️ Known Limitations
 
-- **Clipboard in the background**: since Android 10, apps that are not in the foreground may be blocked from reading the clipboard. Automatic "copy on one phone, paste on the other" worked in first real-world tests, but behavior can differ between Android versions and manufacturers. If it doesn't trigger on your device, use the in-app **Send** box or **Pick File**.
+- **Clipboard in the background**: since Android 10, apps that are not in the foreground may be blocked from reading the clipboard. Automatic "copy on one phone, paste on the other" worked in first real-world tests, but behavior can differ between Android versions and manufacturers. If it doesn't trigger on your device, use the **Send clipboard** notification button, the Share menu, or the in-app **Clipboard** / **File** buttons.
 - Wi-Fi Direct needs the other device to accept the connection request, and some manufacturers restrict it in the background.
 - BLE and Wi-Fi Direct behavior varies a lot between phones; please open an issue with your device model if something doesn't work.
 
@@ -94,11 +125,17 @@ app/src/main/java/com/almog/radioclip/
 │   ├── Crypto.kt            # Pairing-code key derivation, AES-GCM encrypt/decrypt
 │   ├── SecureStreams.kt     # Encrypted, authenticated framing for TCP streams
 │   ├── ChunkCodec.kt        # BLE packet splitting & ordered reassembly
-│   └── FileNames.kt         # Safe handling of received file names
+│   ├── FileNames.kt         # Safe handling of received file names
+│   ├── Settings.kt          # User options (clipboard, Bluetooth mode, Wi-Fi, files)
+│   ├── ClipPolicy.kt        # Decides which copied text is sent
+│   └── Advertisement.kt     # Bluetooth advertisement tag & link-initiator rule
 ├── security/
 │   └── PairingStore.kt      # Stores the derived key in app-private storage
+├── settings/SettingsStore.kt # Persists Settings
+├── util/SystemChecks.kt     # Permission / Bluetooth / Wi-Fi checks
 ├── service/
-│   └── RadioSyncService.kt  # Foreground Service binding BLE & Wi-Fi transports
+│   ├── RadioSyncService.kt  # Foreground Service binding BLE & Wi-Fi transports
+│   └── QuickSendActivities.kt # Share target & "Send clipboard" screen
 ├── routing/
 │   └── SyncRouter.kt        # Payload routing decisions (BLE vs Wi-Fi)
 ├── transport/
@@ -111,6 +148,7 @@ app/src/main/java/com/almog/radioclip/
 │   └── Payload.kt           # Payload, PeerDevice, TransportState models
 └── ui/
     ├── DashboardScreen.kt   # Jetpack Compose dashboard UI
+    ├── SettingsScreen.kt    # Settings & diagnostics
     └── theme/               # Material 3 styling & tokens
 ```
 

@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">RadioClip</string>
+    <string name="share_label">Send with RadioClip</string>
 </resources>

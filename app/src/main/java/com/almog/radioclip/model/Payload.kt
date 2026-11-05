@@ -53,5 +53,7 @@ data class PeerDevice(
     val id: String,
     val name: String,
     val transportType: TransportType,
-    val isConnected: Boolean = false
+    val isConnected: Boolean = false,
+    /** Signal strength in dBm rounded to 10 dB steps (BLE only), or null when unknown. */
+    val rssi: Int? = null
 )

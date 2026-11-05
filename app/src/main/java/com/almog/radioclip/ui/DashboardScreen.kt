@@ -53,6 +53,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.almog.radioclip.core.Crypto
+import com.almog.radioclip.core.Format
+import com.almog.radioclip.util.SystemIssue
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.PeerDevice
 import com.almog.radioclip.model.TransportState
@@ -77,7 +79,14 @@ fun DashboardScreen(
     onConnectPeer: (transportType: TransportType, peerId: String) -> Unit,
     onSendText: (String) -> Unit,
     onSendFile: (name: String, mimeType: String, sizeBytes: Long, uriString: String) -> Unit,
-    onRequestPermissions: () -> Unit
+    systemIssues: List<SystemIssue>,
+    wifiEnabled: Boolean,
+    onRescanBle: () -> Unit,
+    onRescanWifi: () -> Unit,
+    onSendClipboard: () -> Unit,
+    onCopyText: (String) -> Unit,
+    onClearHistory: () -> Unit,
+    onOpenSettings: () -> Unit
 ) {
     val context = LocalContext.current
     var textInput by remember { mutableStateOf("") }
@@ -135,10 +144,10 @@ fun DashboardScreen(
                 ),
                 actions = {
                     FilledTonalButton(
-                        onClick = onRequestPermissions,
+                        onClick = onOpenSettings,
                         modifier = Modifier.padding(end = 8.dp)
                     ) {
-                        Text("Perms")
+                        Text("Settings")
                     }
                 }
             )
@@ -151,6 +160,32 @@ fun DashboardScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // Things on the phone that stop RadioClip from working (Bluetooth off, missing permission...)
+            items(systemIssues.size) { index ->
+                val issue = systemIssues[index]
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            issue.message,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        if (issue.actionLabel != null && issue.action != null) {
+                            Button(onClick = issue.action) { Text(issue.actionLabel) }
+                        }
+                    }
+                }
+            }
+
             // Pairing code: all traffic is encrypted with it
             item {
                 PairingCard(
@@ -169,17 +204,19 @@ fun DashboardScreen(
                     StatusCard(
                         modifier = Modifier.weight(1f),
                         title = "BLE GATT",
-                        subtitle = "Text <= 20 KB",
+                        subtitle = if (wifiEnabled) "Text & small items" else "Text only (Wi-Fi off)",
                         state = bleState,
                         connectedCount = connectedBlePeers.size
                     )
-                    StatusCard(
-                        modifier = Modifier.weight(1f),
-                        title = "Wi-Fi Direct",
-                        subtitle = "Files & Large Payloads",
-                        state = wifiState,
-                        connectedCount = connectedWifiPeers.size
-                    )
+                    if (wifiEnabled) {
+                        StatusCard(
+                            modifier = Modifier.weight(1f),
+                            title = "Wi-Fi Direct",
+                            subtitle = "Files & Large Payloads",
+                            state = wifiState,
+                            connectedCount = connectedWifiPeers.size
+                        )
+                    }
                 }
             }
 
@@ -189,14 +226,15 @@ fun DashboardScreen(
                     title = "Bluetooth Peers (BLE)",
                     peers = discoveredBlePeers,
                     connectedPeers = connectedBlePeers,
-                    emptyText = "Scanning for nearby RadioClip BLE devices...",
+                    emptyText = "Scanning for nearby RadioClip devices. Make sure both phones use the same pairing code.",
                     transportType = TransportType.BLE_GATT,
-                    onConnect = { onConnectPeer(TransportType.BLE_GATT, it) }
+                    onConnect = { onConnectPeer(TransportType.BLE_GATT, it) },
+                    onRescan = onRescanBle
                 )
             }
 
             // Wi-Fi Direct Peers Section
-            item {
+            if (wifiEnabled) item {
                 // Once a P2P group forms, Android stops returning connected devices in scan
                 // results. Merge connectedWifiPeers into the displayed list so CONNECTED peers
                 // stay visible even after discovery clears them from discoveredWifiPeers.
@@ -214,7 +252,8 @@ fun DashboardScreen(
                     connectedPeers = connectedWifiPeers,
                     emptyText = "Searching for nearby Android Wi-Fi Direct devices...",
                     transportType = TransportType.WIFI_DIRECT_SOCKET,
-                    onConnect = { onConnectPeer(TransportType.WIFI_DIRECT_SOCKET, it) }
+                    onConnect = { onConnectPeer(TransportType.WIFI_DIRECT_SOCKET, it) },
+                    onRescan = onRescanWifi
                 )
             }
 
@@ -253,10 +292,13 @@ fun DashboardScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilledTonalButton(onClick = onSendClipboard) {
+                                    Text("Clipboard")
+                                }
                                 FilledTonalButton(
                                     onClick = { filePickerLauncher.launch("*/*") }
                                 ) {
-                                    Text("Pick File")
+                                    Text("File")
                                 }
                                 Button(
                                     onClick = {
@@ -277,11 +319,18 @@ fun DashboardScreen(
 
             // Activity History Title
             item {
-                Text(
-                    "Activity History (${history.size})",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Activity History (${history.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    if (history.isNotEmpty()) TextButton(onClick = onClearHistory) { Text("Clear") }
+                }
             }
 
             if (history.isEmpty()) {
@@ -301,7 +350,7 @@ fun DashboardScreen(
                 }
             } else {
                 items(history, key = { it.id }) { payload ->
-                    PayloadItem(payload = payload)
+                    PayloadItem(payload = payload, onCopyText = onCopyText)
                 }
             }
         }
@@ -387,7 +436,8 @@ fun PeerSectionCard(
     connectedPeers: List<PeerDevice>,
     emptyText: String,
     transportType: TransportType,
-    onConnect: (String) -> Unit
+    onConnect: (String) -> Unit,
+    onRescan: (() -> Unit)? = null
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -405,11 +455,14 @@ fun PeerSectionCard(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
-                Text(
-                    "${peers.size} found",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "${peers.size} found",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (onRescan != null) TextButton(onClick = onRescan) { Text("Rescan") }
+                }
             }
 
             Spacer(modifier = Modifier.height(8.dp))
@@ -443,7 +496,7 @@ fun PeerSectionCard(
                                     style = MaterialTheme.typography.bodyMedium
                                 )
                                 Text(
-                                    text = peer.id,
+                                    text = if (peer.rssi != null) Format.signalLabel(peer.rssi) else peer.id,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -549,7 +602,7 @@ fun StatusCard(
 }
 
 @Composable
-fun PayloadItem(payload: Payload) {
+fun PayloadItem(payload: Payload, onCopyText: (String) -> Unit = {}) {
     val timeFormatted = remember(payload.timestamp) {
         SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(payload.timestamp))
     }
@@ -632,8 +685,10 @@ fun PayloadItem(payload: Payload) {
                     Text(
                         text = payload.content,
                         style = MaterialTheme.typography.bodyMedium,
-                        fontFamily = FontFamily.Monospace
+                        fontFamily = FontFamily.Monospace,
+                        maxLines = 12
                     )
+                    TextButton(onClick = { onCopyText(payload.content) }) { Text("Copy") }
                 }
                 is Payload.File -> {
                     Row(

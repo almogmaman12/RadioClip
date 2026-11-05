@@ -27,6 +27,9 @@ private fun frameNonce(prefix: ByteArray, counter: Int): ByteArray {
     return nonce
 }
 
+/** Thrown when a frame fails authentication: wrong pairing code, or the data was altered. */
+class FrameAuthenticationException(message: String) : IOException(message)
+
 class SecureOutputStream(
     private val out: OutputStream,
     private val key: ByteArray
@@ -154,7 +157,7 @@ class SecureInputStream(
         if (counter == Int.MAX_VALUE) throw IOException("Secure stream frame counter exhausted")
 
         plain = Crypto.open(key, frameNonce(p, counter++), ciphertext, 0, len)
-            ?: throw IOException("Frame authentication failed (wrong pairing code or tampered data)")
+            ?: throw FrameAuthenticationException("Frame authentication failed (wrong pairing code or tampered data)")
         pos = 0
         limit = plain.size
         return true
