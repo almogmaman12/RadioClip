@@ -12,6 +12,8 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pDeviceList
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest
 import android.os.Build
 import android.util.Log
 import com.almog.radioclip.security.SecureLink
@@ -66,6 +68,10 @@ class WifiEngine(
         private const val FILE_CHUNK = 64 * 1024
         private const val MAX_TEXT_BYTES = 1024 * 1024
         private const val CRYPTO_OVERHEAD = 28
+        private const val SERVICE_INSTANCE = "RadioClip"
+        private const val SERVICE_TYPE = "_radioclip._tcp"
+        private const val SERVICE_PROTOCOL = "2"
+        private const val PEER_EXPIRY_MS = 90_000L
     }
 
     override val transportType: TransportType = TransportType.WIFI_DIRECT_SOCKET
@@ -100,6 +106,11 @@ class WifiEngine(
 
     private val connectedClientIps = ConcurrentHashMap.newKeySet<String>()
     private val discoveredDevices = ConcurrentHashMap<String, WifiP2pDevice>()
+    // Only devices advertising the RadioClip DNS-SD service are displayable.
+    private val radioClipSeenAt = ConcurrentHashMap<String, Long>()
+    private var localRadioClipService: WifiP2pDnsSdServiceInfo? = null
+    private var radioClipServiceRequest: WifiP2pDnsSdServiceRequest? = null
+    private var discoveryRetryJob: Job? = null
     private val deliveredIds = ConcurrentHashMap<String, Long>()
 
     // MAC address of the peer we initiated connect() to, used for UI ID matching
@@ -117,6 +128,7 @@ class WifiEngine(
                 }
 
                 WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
+                    // General P2P peer results alone DO NOT identify RadioClip devices.
                     requestPeers()
                 }
 
@@ -185,7 +197,7 @@ class WifiEngine(
         }
 
         _state.value = TransportState.SCANNING
-        startPeerDiscovery()
+        registerRadioClipDiscovery()
         // Never expose a TCP receiver before a Wi-Fi Direct group exists.
         startConnectionMonitor()
     }
@@ -239,6 +251,8 @@ class WifiEngine(
     override suspend fun stop() = withContext(Dispatchers.IO) {
         connectionMonitorJob?.cancel()
         connectionMonitorJob = null
+        discoveryRetryJob?.cancel()
+        discoveryRetryJob = null
 
         if (isReceiverRegistered) {
             try {
@@ -255,8 +269,14 @@ class WifiEngine(
         val ch = channel
         if (p2p != null && ch != null) {
             p2p.stopPeerDiscovery(ch, null)
+            radioClipServiceRequest?.let { p2p.removeServiceRequest(ch, it, null) }
+            localRadioClipService?.let { p2p.removeLocalService(ch, it, null) }
             p2p.removeGroup(ch, null)
         }
+        radioClipServiceRequest = null
+        localRadioClipService = null
+        radioClipSeenAt.clear()
+        discoveredDevices.clear()
 
         _discoveredPeers.value = emptyList()
         _connectedPeers.value = emptyList()
@@ -265,17 +285,123 @@ class WifiEngine(
         _state.value = TransportState.IDLE
     }
 
-    fun startPeerDiscovery() {
+    /**
+     * General discoverPeers() finds TVs, printers, and unrelated phones.
+     * Android's DNS-SD service discovery identifies devices advertising
+     * RadioClip's own protocol before they are offered for connection.
+     */
+    private fun registerRadioClipDiscovery() {
         val p2p = wifiP2pManager ?: return
         val ch = channel ?: return
 
-        p2p.discoverPeers(ch, object : WifiP2pManager.ActionListener {
+        p2p.setDnsSdResponseListeners(
+            ch,
+            WifiP2pManager.DnsSdServiceResponseListener { instance, serviceType, device ->
+                if (instance.equals(SERVICE_INSTANCE, ignoreCase = true) &&
+                    serviceType.startsWith(SERVICE_TYPE, ignoreCase = true)
+                ) {
+                    markRadioClipPeer(device)
+                }
+            },
+            WifiP2pManager.DnsSdTxtRecordListener { domain, record, device ->
+                if (domain.contains(SERVICE_TYPE, ignoreCase = true) &&
+                    record["protocol"] == SERVICE_PROTOCOL
+                ) {
+                    markRadioClipPeer(device)
+                }
+            }
+        )
+
+        val service = WifiP2pDnsSdServiceInfo.newInstance(
+            SERVICE_INSTANCE,
+            SERVICE_TYPE,
+            mapOf("protocol" to SERVICE_PROTOCOL, "port" to PORT.toString())
+        )
+        localRadioClipService = service
+        p2p.addLocalService(ch, service, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                Log.d(TAG, "Wi-Fi Direct peer discovery started successfully")
+                Log.d(TAG, "RadioClip DNS-SD service advertised")
+                startPeerDiscovery()
             }
 
             override fun onFailure(reason: Int) {
-                Log.e(TAG, "Wi-Fi Direct peer discovery failed: $reason")
+                Log.e(TAG, "Could not advertise RadioClip DNS-SD service: $reason")
+                // The P2P engine isn't ready to find other RadioClip devices.
+                _state.value = TransportState.ERROR
+            }
+        })
+
+        // Android can stop discovering after radio power or group changes.
+        discoveryRetryJob?.cancel()
+        discoveryRetryJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(30_000L)
+                if (_state.value == TransportState.SCANNING ||
+                    _state.value == TransportState.DISCONNECTED
+                ) {
+                    startPeerDiscovery()
+                }
+            }
+        }
+    }
+
+    private fun markRadioClipPeer(device: WifiP2pDevice) {
+        if (_state.value == TransportState.IDLE) return
+        val address = device.deviceAddress ?: return
+        if (address.isBlank()) return
+        radioClipSeenAt[address] = System.currentTimeMillis()
+        discoveredDevices[address] = device
+        refreshVerifiedPeerList()
+    }
+
+    private fun refreshVerifiedPeerList() {
+        val now = System.currentTimeMillis()
+        radioClipSeenAt.entries.removeIf { now - it.value > PEER_EXPIRY_MS }
+        _discoveredPeers.value = radioClipSeenAt.keys.mapNotNull { address ->
+            val device = discoveredDevices[address] ?: return@mapNotNull null
+            PeerDevice(
+                id = address,
+                name = device.deviceName?.takeIf { it.isNotBlank() }
+                    ?: "RadioClip (${address.takeLast(5)})",
+                transportType = TransportType.WIFI_DIRECT_SOCKET,
+                isConnected = _connectedPeers.value.any { it.id == address }
+            )
+        }.sortedBy { it.name }
+    }
+
+    fun startPeerDiscovery() {
+        val p2p = wifiP2pManager ?: return
+        val ch = channel ?: return
+        if (_state.value == TransportState.IDLE) return
+
+        if (radioClipServiceRequest == null) {
+            val request = WifiP2pDnsSdServiceRequest.newInstance(SERVICE_TYPE)
+            p2p.addServiceRequest(ch, request, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    radioClipServiceRequest = request
+                    searchRadioClipServices()
+                }
+
+                override fun onFailure(reason: Int) {
+                    Log.w(TAG, "Could not register RadioClip service search: $reason")
+                }
+            })
+        } else {
+            searchRadioClipServices()
+        }
+    }
+
+    private fun searchRadioClipServices() {
+        val p2p = wifiP2pManager ?: return
+        val ch = channel ?: return
+        refreshVerifiedPeerList()
+        p2p.discoverServices(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(TAG, "Searching only for RadioClip DNS-SD services")
+            }
+
+            override fun onFailure(reason: Int) {
+                Log.w(TAG, "RadioClip service discovery failed: $reason")
             }
         })
     }
@@ -283,39 +409,15 @@ class WifiEngine(
     private fun requestPeers() {
         val p2p = wifiP2pManager ?: return
         val ch = channel ?: return
-
         p2p.requestPeers(ch) { peers: WifiP2pDeviceList? ->
-            val list = mutableListOf<PeerDevice>()
+            // Refresh metadata solely for peers already identified by DNS-SD.
             peers?.deviceList?.forEach { device ->
-                if (!isExcludedDevice(device)) {
+                if (radioClipSeenAt.containsKey(device.deviceAddress)) {
                     discoveredDevices[device.deviceAddress] = device
-                    list.add(
-                        PeerDevice(
-                            id = device.deviceAddress,
-                            name = device.deviceName?.takeIf { it.isNotBlank() } ?: "Android (${device.deviceAddress.takeLast(5)})",
-                            transportType = TransportType.WIFI_DIRECT_SOCKET,
-                            isConnected = device.status == WifiP2pDevice.CONNECTED
-                        )
-                    )
                 }
             }
-            _discoveredPeers.value = list
-            Log.d(TAG, "Discovered ${list.size} eligible Wi-Fi Direct peers")
+            refreshVerifiedPeerList()
         }
-    }
-
-    private fun isExcludedDevice(device: WifiP2pDevice): Boolean {
-        val name = device.deviceName?.lowercase() ?: ""
-        val primaryType = device.primaryDeviceType?.lowercase() ?: ""
-
-        val excludedKeywords = listOf("bravia", "webos", "roku", "printer", "chromecast", "fridge")
-        if (excludedKeywords.any { name.contains(it) }) return true
-
-        if (primaryType.startsWith("7-") || primaryType.startsWith("3-") || primaryType.startsWith("8-")) {
-            return true
-        }
-
-        return false
     }
 
     override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.IO) {
@@ -327,6 +429,10 @@ class WifiEngine(
                 return@suspendCoroutine
             }
 
+            if (!radioClipSeenAt.containsKey(peerId)) {
+                cont.resume(Result.failure(IllegalArgumentException("This device is not advertising RadioClip")))
+                return@suspendCoroutine
+            }
             _state.value = TransportState.CONNECTING
             pendingConnectMac = peerId // Track MAC address for UI peer ID matching
 
