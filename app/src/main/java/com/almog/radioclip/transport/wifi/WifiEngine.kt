@@ -33,6 +33,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
+import java.io.EOFException
 import java.io.DataOutputStream
 import java.io.File
 import java.io.InputStream
@@ -40,6 +41,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -53,6 +55,7 @@ class WifiEngine(
         private const val TAG = "WifiEngine"
         const val PORT = 8888
         private const val SOCKET_TIMEOUT_MS = 10000
+        private const val MAX_FILE_SIZE_BYTES = 512L * 1024 * 1024
 
         // Stream wire protocol tags
         private const val TYPE_TEXT: Byte = 1
@@ -175,7 +178,7 @@ class WifiEngine(
 
         _state.value = TransportState.SCANNING
         startPeerDiscovery()
-        startServerSocket()
+        // Never expose a TCP receiver before a Wi-Fi Direct group exists.
         startConnectionMonitor()
     }
 
@@ -216,6 +219,7 @@ class WifiEngine(
     }
 
     private fun handleGroupDisconnected() {
+        closeServerSocket()
         _state.value = TransportState.DISCONNECTED
         _connectedPeers.value = emptyList()
         groupOwnerAddress = null
@@ -237,9 +241,7 @@ class WifiEngine(
             isReceiverRegistered = false
         }
 
-        serverJob?.cancel()
-        serverSocket?.close()
-        serverSocket = null
+        closeServerSocket()
 
         val p2p = wifiP2pManager
         val ch = channel
@@ -443,7 +445,19 @@ class WifiEngine(
         }
     }
 
+    private fun closeServerSocket() {
+        serverJob?.cancel()
+        try {
+            serverSocket?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not close Wi-Fi receiver socket", e)
+        }
+        serverSocket = null
+        serverJob = null
+    }
+
     private fun startServerSocket() {
+        if (groupOwnerAddress == null || _state.value != TransportState.CONNECTED) return
         if (serverSocket != null && serverSocket?.isClosed == false) return
 
         serverJob?.cancel()
@@ -456,6 +470,11 @@ class WifiEngine(
 
                 while (isActive) {
                     val socket = serverSocket?.accept() ?: break
+                    socket.soTimeout = SOCKET_TIMEOUT_MS
+                    if (_state.value != TransportState.CONNECTED || groupOwnerAddress == null) {
+                        socket.close()
+                        continue
+                    }
                     val clientIp = socket.inetAddress?.hostAddress
                     if (clientIp != null && isGroupOwner) {
                         connectedClientIps.add(clientIp)
@@ -556,18 +575,33 @@ class WifiEngine(
                         val mimeType = input.readUTF()
                         val fileSize = input.readLong()
 
-                        val receivedDir = File(context.cacheDir, "received_files").apply { mkdirs() }
-                        val targetFile = File(receivedDir, fileName)
+                        require(fileSize in 0..MAX_FILE_SIZE_BYTES) {
+                            "Invalid or oversized incoming file: $fileSize bytes"
+                        }
 
-                        targetFile.outputStream().use { out ->
-                            val buffer = ByteArray(64 * 1024)
-                            var remaining = fileSize
-                            while (remaining > 0) {
-                                val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-                                if (read == -1) break
-                                out.write(buffer, 0, read)
-                                remaining -= read
+                        // Strip any directory components from untrusted filenames. Use a
+                        // generated prefix to prevent accidental overwrites or traversal.
+                        val safeName = fileName.substringAfterLast('/').substringAfterLast('\\')
+                            .replace(Regex("[\\x00-\\x1F\\x7F]"), "_")
+                            .take(120).ifBlank { "received_file" }
+                        val receivedDir = File(context.filesDir, "received_files").apply { mkdirs() }
+                        val targetFile = File(receivedDir, "${UUID.randomUUID()}-$safeName")
+
+                        try {
+                            targetFile.outputStream().use { out ->
+                                val buffer = ByteArray(64 * 1024)
+                                var remaining = fileSize
+                                while (remaining > 0) {
+                                    val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                                    if (read < 0) throw EOFException("File transfer interrupted with $remaining bytes remaining")
+                                    if (read == 0) continue
+                                    out.write(buffer, 0, read)
+                                    remaining -= read
+                                }
                             }
+                        } catch (e: Exception) {
+                            targetFile.delete()
+                            throw e
                         }
 
                         _incomingPayloads.emit(
@@ -577,7 +611,7 @@ class WifiEngine(
                                 transportType = TransportType.WIFI_DIRECT_SOCKET,
                                 senderDeviceName = resolvedSenderName,
                                 isOutgoing = false,
-                                fileName = fileName,
+                                fileName = safeName,
                                 mimeType = mimeType,
                                 sizeBytes = fileSize,
                                 localPath = targetFile.absolutePath
@@ -605,6 +639,7 @@ class WifiEngine(
 
             Socket().use { socket ->
                 socket.connect(InetSocketAddress(destinationIp, PORT), SOCKET_TIMEOUT_MS)
+                socket.soTimeout = SOCKET_TIMEOUT_MS
                 val output = DataOutputStream(socket.getOutputStream())
 
                 when (payload) {
@@ -617,6 +652,9 @@ class WifiEngine(
                     }
 
                     is Payload.File -> {
+                        require(payload.sizeBytes in 0..MAX_FILE_SIZE_BYTES) {
+                            "File size is unknown, invalid or exceeds the 512 MB limit"
+                        }
                         output.writeByte(TYPE_FILE.toInt())
                         output.writeUTF(payload.id)
                         output.writeLong(payload.timestamp)
@@ -632,10 +670,15 @@ class WifiEngine(
 
                         inputStream?.use { stream ->
                             val buffer = ByteArray(64 * 1024)
-                            var read: Int
-                            while (stream.read(buffer).also { read = it } != -1) {
+                            var remaining = payload.sizeBytes
+                            while (remaining > 0L) {
+                                val read = stream.read(buffer, 0, minOf(remaining, buffer.size.toLong()).toInt())
+                                if (read < 0) throw EOFException("File ended before the reported size")
+                                if (read == 0) continue
                                 output.write(buffer, 0, read)
+                                remaining -= read
                             }
+                            require(stream.read() == -1) { "File is larger than the size reported by Android" }
                         } ?: error("Unable to open stream for file payload: ${payload.fileName}")
 
                         output.flush()
