@@ -169,16 +169,22 @@ class BleEngine(
             offset: Int,
             value: ByteArray?
         ) {
+            val valid = !preparedWrite && offset == 0 &&
+                characteristic.uuid == CHARACTERISTIC_UUID && value != null
             if (responseNeeded) {
                 try {
-                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+                    gattServer?.sendResponse(
+                        device, requestId,
+                        if (valid) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE,
+                        offset, null
+                    )
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed sending GATT response", e)
                 }
             }
 
-            if (value != null && characteristic.uuid == CHARACTERISTIC_UUID) {
-                handleIncomingChunk(device.address, value)
+            if (valid) {
+                handleIncomingChunk(device.address, value!!)
             }
         }
 
@@ -751,9 +757,8 @@ class BleEngine(
         val buffers = incomingPacketBuffers.getOrPut(senderAddress) { ConcurrentHashMap() }
         val now = System.currentTimeMillis()
         buffers.entries.removeIf { now - it.value.createdAt > ASSEMBLY_TIMEOUT_MS }
-        if (buffers.size >= 16) return
-
         val key = "$hash-$total"
+        if (buffers.size >= 16 && !buffers.containsKey(key)) return
         val message = buffers.getOrPut(key) { IncomingMessage(total, now) }
         val complete: ByteArray? = synchronized(message) {
             if (message.parts[index] != null) {
