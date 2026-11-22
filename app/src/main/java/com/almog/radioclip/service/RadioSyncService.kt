@@ -19,11 +19,12 @@ import com.almog.radioclip.MainActivity
 import com.almog.radioclip.R
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.TransportType
+import com.almog.radioclip.security.SecureLink
+import kotlinx.coroutines.Dispatchers
 import com.almog.radioclip.routing.SyncRouter
 import com.almog.radioclip.transport.ble.BleEngine
 import com.almog.radioclip.transport.wifi.WifiEngine
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -74,6 +75,28 @@ class RadioSyncService : Service() {
     lateinit var router: SyncRouter
         private set
 
+    lateinit var secureLink: SecureLink
+        private set
+
+    private val _pairingError = MutableStateFlow<String?>(null)
+    val pairingError: StateFlow<String?> = _pairingError.asStateFlow()
+
+    fun setPairingPhrase(phrase: String) {
+        serviceScope.launch(Dispatchers.Default) {
+            try {
+                secureLink.configurePhrase(phrase)
+                _pairingError.value = null
+            } catch (e: Exception) {
+                _pairingError.value = e.message ?: "Unable to configure pairing"
+            }
+        }
+    }
+
+    fun forgetPairingPhrase() {
+        secureLink.forgetPhrase()
+        setClipboardSyncEnabled(false)
+    }
+
     private val _history = MutableStateFlow<List<Payload>>(emptyList())
     val history: StateFlow<List<Payload>> = _history.asStateFlow()
 
@@ -106,8 +129,9 @@ class RadioSyncService : Service() {
             .getBoolean("clipboard_sync_enabled", false)
         createNotificationChannel()
 
-        bleEngine = BleEngine(applicationContext, serviceScope)
-        wifiEngine = WifiEngine(applicationContext, serviceScope)
+        secureLink = SecureLink(applicationContext)
+        bleEngine = BleEngine(applicationContext, serviceScope, secureLink)
+        wifiEngine = WifiEngine(applicationContext, serviceScope, secureLink)
         router = SyncRouter(bleEngine, wifiEngine, serviceScope)
 
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -121,7 +145,8 @@ class RadioSyncService : Service() {
                 _history.value = (listOf(payload) + _history.value).take(historyLimit)
 
                 // If incoming payload is text, update local clipboard without re-broadcasting
-                if (payload is Payload.Text && _clipboardSyncEnabled.value) {
+                if (payload is Payload.Text && _clipboardSyncEnabled.value &&
+                    secureLink.configured.value) {
                     applyToLocalClipboard(payload.content)
                 } else if (payload is Payload.File) {
                     // Trigger notification alert when receiving a file
@@ -197,7 +222,7 @@ class RadioSyncService : Service() {
     }
 
     private fun handleClipboardChanged() {
-        if (!_clipboardSyncEnabled.value) return
+        if (!_clipboardSyncEnabled.value || !secureLink.configured.value) return
         val clip = clipboardManager?.primaryClip ?: return
         if (clip.itemCount > 0) {
             val text = clip.getItemAt(0)?.text?.toString()
