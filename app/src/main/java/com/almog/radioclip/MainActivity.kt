@@ -68,7 +68,10 @@ class MainActivity : ComponentActivity() {
                 val permissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
                 ) { permissions ->
-                    val allGranted = permissions.values.all { it }
+                    // Notification permission is optional for starting an Android 13+ service.
+                    val allGranted = permissions
+                        .filterKeys { it != Manifest.permission.POST_NOTIFICATIONS }
+                        .values.all { it }
                     if (allGranted) {
                         startAndBindService()
                     }
@@ -126,6 +129,8 @@ class MainActivity : ComponentActivity() {
                 val connectedBlePeers = currentService?.bleEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
                 val connectedWifiPeers = currentService?.wifiEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
                 val history = currentService?.history?.collectAsState()?.value ?: emptyList()
+                val clipboardSyncEnabled =
+                    currentService?.clipboardSyncEnabled?.collectAsState()?.value ?: false
 
                 DashboardScreen(
                     bleState = bleState,
@@ -135,6 +140,8 @@ class MainActivity : ComponentActivity() {
                     connectedBlePeers = connectedBlePeers,
                     connectedWifiPeers = connectedWifiPeers,
                     history = history,
+                    clipboardSyncEnabled = clipboardSyncEnabled,
+                    onClipboardSyncChange = { currentService?.setClipboardSyncEnabled(it) },
                     onConnectPeer = { transportType, peerId ->
                         currentService?.connectToPeer(transportType, peerId)
                     },
