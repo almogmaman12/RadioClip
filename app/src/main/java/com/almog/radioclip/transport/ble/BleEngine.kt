@@ -27,6 +27,7 @@ import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.almog.radioclip.security.SecureLink
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.PeerDevice
 import com.almog.radioclip.model.TransportState
@@ -56,7 +57,8 @@ import java.util.concurrent.ConcurrentHashMap
 @SuppressLint("MissingPermission")
 class BleEngine(
     private val context: Context,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job())
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job()),
+    private val secureLink: SecureLink
 ) : DeviceTransport {
 
     companion object {
@@ -621,9 +623,10 @@ class BleEngine(
                     error("BleEngine only transfers text payloads")
                 }
 
-                val data = payload.content.toByteArray(Charsets.UTF_8)
-                require(data.size <= MAX_MESSAGE_BYTES) { "BLE message exceeds 20 KB" }
                 val payloadIdHash = payload.id.hashCode()
+                val aad = ByteBuffer.allocate(4).putInt(payloadIdHash).array()
+                val data = secureLink.seal(payload.content.toByteArray(Charsets.UTF_8), aad)
+                require(data.size <= MAX_MESSAGE_BYTES) { "Encrypted BLE message exceeds 20 KB" }
 
                 // Check active clients
                 val clients = if (targetPeerId != null) {
@@ -785,13 +788,19 @@ class BleEngine(
             val device = scannedDevicesMap[senderAddress] ?: serverConnectedDevices[senderAddress]
             val name = if (device != null) getDeviceDisplayName(device, null) else "Peer ($senderAddress)"
             scope.launch {
-                _incomingPayloads.emit(
-                    Payload.Text(
-                        transportType = TransportType.BLE_GATT,
-                        senderDeviceName = name,
-                        content = String(complete, Charsets.UTF_8)
+                try {
+                    val aad = ByteBuffer.allocate(4).putInt(hash).array()
+                    val cleartext = secureLink.open(complete, aad)
+                    _incomingPayloads.emit(
+                        Payload.Text(
+                            transportType = TransportType.BLE_GATT,
+                            senderDeviceName = name,
+                            content = String(cleartext, Charsets.UTF_8)
+                        )
                     )
-                )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Rejected unauthenticated or damaged BLE message", e)
+                }
             }
         }
     }
