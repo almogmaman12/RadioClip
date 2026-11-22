@@ -85,6 +85,7 @@ class RadioSyncService : Service() {
         serviceScope.launch(Dispatchers.Default) {
             try {
                 secureLink.configurePhrase(phrase)
+                wifiEngine.onPairingChanged()
                 _pairingError.value = null
             } catch (e: Exception) {
                 _pairingError.value = e.message ?: "Unable to configure pairing"
