@@ -10,6 +10,8 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattServer
 import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.AdvertiseCallback
@@ -31,6 +33,7 @@ import com.almog.radioclip.model.TransportState
 import com.almog.radioclip.model.TransportType
 import com.almog.radioclip.transport.DeviceTransport
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -44,6 +47,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -61,6 +65,11 @@ class BleEngine(
         val CHARACTERISTIC_UUID: UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
         private const val REQUESTED_MTU = 512
         private const val DEFAULT_CHUNK_SIZE = 500
+        private const val DEFAULT_MTU = 23
+        private const val MAX_MESSAGE_BYTES = 20 * 1024
+        private const val MAX_CHUNKS = 2048
+        private const val ASSEMBLY_TIMEOUT_MS = 30_000L
+        private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
     }
 
     override val transportType: TransportType = TransportType.BLE_GATT
@@ -89,7 +98,16 @@ class BleEngine(
     private val sendMutex = Mutex()
 
     private val targetReconnectAddresses = ConcurrentHashMap.newKeySet<String>()
-    private val incomingPacketBuffers = ConcurrentHashMap<String, ConcurrentHashMap<String, ByteArrayOutputStream>>()
+    private class IncomingMessage(val totalChunks: Int, val createdAt: Long) {
+        val parts = arrayOfNulls<ByteArray>(totalChunks)
+        var received = 0
+        var byteCount = 0
+    }
+
+    private val incomingPacketBuffers = ConcurrentHashMap<String, ConcurrentHashMap<String, IncomingMessage>>()
+    private val subscribedServerDevices = ConcurrentHashMap.newKeySet<String>()
+    private val pendingClientWrites = ConcurrentHashMap<String, CompletableDeferred<Int>>()
+    private val pendingServerNotifications = ConcurrentHashMap<String, CompletableDeferred<Int>>()
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
@@ -132,10 +150,10 @@ class BleEngine(
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 serverConnectedDevices[address] = device
-                targetReconnectAddresses.add(address)
                 updateConnectedPeers(address, name, true)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 serverConnectedDevices.remove(address)
+                subscribedServerDevices.remove(address)
                 updateConnectedPeers(address, name, false)
                 incomingPacketBuffers.remove(address)
                 triggerAutoReconnect(address)
@@ -162,6 +180,36 @@ class BleEngine(
             if (value != null && characteristic.uuid == CHARACTERISTIC_UUID) {
                 handleIncomingChunk(device.address, value)
             }
+        }
+
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            descriptor: BluetoothGattDescriptor,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray?
+        ) {
+            val valid = descriptor.uuid == CCCD_UUID && !preparedWrite && offset == 0
+            if (valid && value != null) {
+                if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+                    subscribedServerDevices.add(device.address)
+                } else if (value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)) {
+                    subscribedServerDevices.remove(device.address)
+                }
+            }
+            if (responseNeeded) {
+                gattServer?.sendResponse(
+                    device, requestId,
+                    if (valid) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE,
+                    offset, null
+                )
+            }
+        }
+
+        override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            pendingServerNotifications[device.address]?.complete(status)
         }
 
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
@@ -211,6 +259,11 @@ class BleEngine(
         }
         activeGattClients.clear()
         serverConnectedDevices.clear()
+        subscribedServerDevices.clear()
+        pendingClientWrites.clear()
+        pendingServerNotifications.clear()
+        incomingPacketBuffers.clear()
+        targetReconnectAddresses.clear()
         scannedDevicesMap.clear()
         _discoveredPeers.value = emptyList()
         _connectedPeers.value = emptyList()
@@ -231,6 +284,12 @@ class BleEngine(
                             BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE or
                             BluetoothGattCharacteristic.PROPERTY_NOTIFY,
                     BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
+                )
+                characteristic.addDescriptor(
+                    BluetoothGattDescriptor(
+                        CCCD_UUID,
+                        BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+                    )
                 )
                 service.addCharacteristic(characteristic)
                 addService(service)
@@ -360,11 +419,7 @@ class BleEngine(
             _discoveredPeers.value = currentDiscovered
         }
 
-        // Auto-connect if not connected yet
-        if (!activeGattClients.containsKey(address) && _connectedPeers.value.none { it.id == address }) {
-            Log.d(TAG, "Auto-connecting to RadioClip peer: $name ($address)")
-            connectToPeerDevice(device)
-        }
+        // Connection requires a deliberate tap: never auto-connect to unknown peers.
     }
 
     override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.IO) {
@@ -425,8 +480,59 @@ class BleEngine(
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    Log.d(TAG, "Services discovered for ${gatt.device.address}")
+                    val characteristic = gatt.getService(SERVICE_UUID)
+                        ?.getCharacteristic(CHARACTERISTIC_UUID)
+                    if (characteristic == null) {
+                        Log.w(TAG, "Peer lacks the RadioClip GATT characteristic")
+                        return
+                    }
+                    // Notifications must be explicitly enabled on both sides of GATT.
+                    gatt.setCharacteristicNotification(characteristic, true)
+                    characteristic.getDescriptor(CCCD_UUID)?.let { descriptor ->
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeDescriptor(
+                                descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                            )
+                        } else {
+                            @Suppress("DEPRECATION")
+                            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                            @Suppress("DEPRECATION")
+                            gatt.writeDescriptor(descriptor)
+                        }
+                    }
                     _state.value = TransportState.CONNECTED
+                }
+            }
+
+            override fun onCharacteristicWrite(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int
+            ) {
+                if (characteristic.uuid == CHARACTERISTIC_UUID) {
+                    pendingClientWrites[gatt.device.address]?.complete(status)
+                }
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray
+            ) {
+                if (characteristic.uuid == CHARACTERISTIC_UUID) {
+                    handleIncomingChunk(gatt.device.address, value)
+                }
+            }
+
+            @Suppress("DEPRECATION")
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic
+            ) {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU &&
+                    characteristic.uuid == CHARACTERISTIC_UUID
+                ) {
+                    handleIncomingChunk(gatt.device.address, characteristic.value ?: return)
                 }
             }
         }
@@ -510,6 +616,7 @@ class BleEngine(
                 }
 
                 val data = payload.content.toByteArray(Charsets.UTF_8)
+                require(data.size <= MAX_MESSAGE_BYTES) { "BLE message exceeds 20 KB" }
                 val payloadIdHash = payload.id.hashCode()
 
                 // Check active clients
@@ -531,7 +638,7 @@ class BleEngine(
                     listOfNotNull(serverConnectedDevices[targetPeerId])
                 } else {
                     serverConnectedDevices.values.toList()
-                }
+                }.filter { subscribedServerDevices.contains(it.address) }
 
                 if (serverDevices.isNotEmpty()) {
                     val service = gattServer?.getService(SERVICE_UUID)
@@ -550,30 +657,39 @@ class BleEngine(
     }
 
     private suspend fun sendChunksOverClient(gatt: BluetoothGatt, data: ByteArray, payloadIdHash: Int) {
-        val mtu = clientMtuMap[gatt.device.address] ?: DEFAULT_CHUNK_SIZE
-        val effectiveChunkSize = (mtu - 15).coerceIn(20, DEFAULT_CHUNK_SIZE)
-        val totalChunks = ((data.size + effectiveChunkSize - 1) / effectiveChunkSize).coerceAtLeast(1)
+        val mtu = clientMtuMap[gatt.device.address] ?: DEFAULT_MTU
+        // ATT overhead (3 bytes) plus RadioClip's chunk header (8 bytes).
+        val chunkSize = (mtu - 11).coerceIn(1, DEFAULT_CHUNK_SIZE)
+        val totalChunks = ((data.size + chunkSize - 1) / chunkSize).coerceAtLeast(1)
+        val characteristic = gatt.getService(SERVICE_UUID)
+            ?.getCharacteristic(CHARACTERISTIC_UUID)
+            ?: error("GATT characteristic unavailable for ${gatt.device.address}")
 
-        val service = gatt.getService(SERVICE_UUID)
-        val characteristic = service?.getCharacteristic(CHARACTERISTIC_UUID)
-            ?: error("GATT Characteristic not found on peer ${gatt.device.address}")
-
-        for (chunkIndex in 0 until totalChunks) {
-            val start = chunkIndex * effectiveChunkSize
-            val end = (start + effectiveChunkSize).coerceAtMost(data.size)
-            val chunkData = if (start < data.size) data.copyOfRange(start, end) else ByteArray(0)
-
-            val packet = ByteBuffer.allocate(8 + chunkData.size).apply {
-                putInt(payloadIdHash)
-                putShort(totalChunks.toShort())
-                putShort(chunkIndex.toShort())
-                put(chunkData)
-            }.array()
-
-            characteristic.value = packet
-            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            gatt.writeCharacteristic(characteristic)
-            delay(15)
+        for (index in 0 until totalChunks) {
+            val start = index * chunkSize
+            val end = (start + chunkSize).coerceAtMost(data.size)
+            val packet = makePacket(payloadIdHash, totalChunks, index, data.copyOfRange(start, end))
+            val ack = CompletableDeferred<Int>()
+            pendingClientWrites[gatt.device.address] = ack
+            try {
+                val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(
+                        characteristic, packet, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    ) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    characteristic.value = packet
+                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    @Suppress("DEPRECATION")
+                    gatt.writeCharacteristic(characteristic)
+                }
+                check(accepted) { "BLE write rejected before transmission" }
+                check(withTimeout(5_000L) { ack.await() } == BluetoothGatt.GATT_SUCCESS) {
+                    "BLE write failed"
+                }
+            } finally {
+                pendingClientWrites.remove(gatt.device.address, ack)
+            }
         }
     }
 
@@ -583,63 +699,96 @@ class BleEngine(
         data: ByteArray,
         payloadIdHash: Int
     ) {
-        val mtu = clientMtuMap[device.address] ?: DEFAULT_CHUNK_SIZE
-        val effectiveChunkSize = (mtu - 15).coerceIn(20, DEFAULT_CHUNK_SIZE)
-        val totalChunks = ((data.size + effectiveChunkSize - 1) / effectiveChunkSize).coerceAtLeast(1)
+        val server = gattServer ?: error("BLE GATT server is closed")
+        val mtu = clientMtuMap[device.address] ?: DEFAULT_MTU
+        val chunkSize = (mtu - 11).coerceIn(1, DEFAULT_CHUNK_SIZE)
+        val totalChunks = ((data.size + chunkSize - 1) / chunkSize).coerceAtLeast(1)
 
-        for (chunkIndex in 0 until totalChunks) {
-            val start = chunkIndex * effectiveChunkSize
-            val end = (start + effectiveChunkSize).coerceAtMost(data.size)
-            val chunkData = if (start < data.size) data.copyOfRange(start, end) else ByteArray(0)
-
-            val packet = ByteBuffer.allocate(8 + chunkData.size).apply {
-                putInt(payloadIdHash)
-                putShort(totalChunks.toShort())
-                putShort(chunkIndex.toShort())
-                put(chunkData)
-            }.array()
-
-            characteristic.value = packet
-            gattServer?.notifyCharacteristicChanged(device, characteristic, false)
-            delay(15)
+        for (index in 0 until totalChunks) {
+            val start = index * chunkSize
+            val end = (start + chunkSize).coerceAtMost(data.size)
+            val packet = makePacket(payloadIdHash, totalChunks, index, data.copyOfRange(start, end))
+            val ack = CompletableDeferred<Int>()
+            pendingServerNotifications[device.address] = ack
+            try {
+                val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    server.notifyCharacteristicChanged(device, characteristic, false, packet) ==
+                        BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    characteristic.value = packet
+                    @Suppress("DEPRECATION")
+                    server.notifyCharacteristicChanged(device, characteristic, false)
+                }
+                check(accepted) { "BLE notification rejected before transmission" }
+                check(withTimeout(5_000L) { ack.await() } == BluetoothGatt.GATT_SUCCESS) {
+                    "BLE notification failed"
+                }
+            } finally {
+                pendingServerNotifications.remove(device.address, ack)
+            }
         }
     }
 
+    private fun makePacket(hash: Int, total: Int, index: Int, bytes: ByteArray): ByteArray =
+        ByteBuffer.allocate(8 + bytes.size).apply {
+            putInt(hash)
+            putShort(total.toShort())
+            putShort(index.toShort())
+            put(bytes)
+        }.array()
+
     private fun handleIncomingChunk(senderAddress: String, packet: ByteArray) {
         if (packet.size < 8) return
-
         val buffer = ByteBuffer.wrap(packet)
-        val payloadIdHash = buffer.int
-        val totalChunks = buffer.short.toInt()
-        val chunkIndex = buffer.short.toInt()
+        val hash = buffer.int
+        val total = buffer.short.toInt() and 0xFFFF
+        val index = buffer.short.toInt() and 0xFFFF
+        if (total !in 1..MAX_CHUNKS || index >= total) return
 
-        val chunkData = ByteArray(packet.size - 8)
-        buffer.get(chunkData)
+        val bytes = ByteArray(packet.size - 8)
+        buffer.get(bytes)
+        val buffers = incomingPacketBuffers.getOrPut(senderAddress) { ConcurrentHashMap() }
+        val now = System.currentTimeMillis()
+        buffers.entries.removeIf { now - it.value.createdAt > ASSEMBLY_TIMEOUT_MS }
+        if (buffers.size >= 16) return
 
-        val deviceBuffers = incomingPacketBuffers.getOrPut(senderAddress) { ConcurrentHashMap() }
-        val streamKey = "$payloadIdHash-$totalChunks"
-        val outputStream = deviceBuffers.getOrPut(streamKey) { ByteArrayOutputStream() }
+        val key = "$hash-$total"
+        val message = buffers.getOrPut(key) { IncomingMessage(total, now) }
+        val complete: ByteArray? = synchronized(message) {
+            if (message.parts[index] != null) {
+                null // Duplicated packet
+            } else if (message.byteCount + bytes.size > MAX_MESSAGE_BYTES) {
+                buffers.remove(key, message)
+                null
+            } else {
+                message.parts[index] = bytes
+                message.received++
+                message.byteCount += bytes.size
+                if (message.received != total) {
+                    null
+                } else {
+                    val result = ByteArrayOutputStream(message.byteCount)
+                    message.parts.forEach { result.write(it!!) }
+                    buffers.remove(key, message)
+                    result.toByteArray()
+                }
+            }
+        }
 
-        outputStream.write(chunkData)
-
-        if (chunkIndex == totalChunks - 1) {
-            val completeBytes = outputStream.toByteArray()
-            val text = String(completeBytes, Charsets.UTF_8)
-            deviceBuffers.remove(streamKey)
-
-            val senderDevice = scannedDevicesMap[senderAddress] ?: serverConnectedDevices[senderAddress]
-            val senderName = if (senderDevice != null) getDeviceDisplayName(senderDevice, null) else "Peer ($senderAddress)"
-
+        if (complete != null) {
+            val device = scannedDevicesMap[senderAddress] ?: serverConnectedDevices[senderAddress]
+            val name = if (device != null) getDeviceDisplayName(device, null) else "Peer ($senderAddress)"
             scope.launch {
                 _incomingPayloads.emit(
                     Payload.Text(
                         transportType = TransportType.BLE_GATT,
-                        senderDeviceName = senderName,
-                        isOutgoing = false,
-                        content = text
+                        senderDeviceName = name,
+                        content = String(complete, Charsets.UTF_8)
                     )
                 )
             }
         }
     }
+
 }
