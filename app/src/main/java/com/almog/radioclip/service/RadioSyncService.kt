@@ -134,6 +134,7 @@ class RadioSyncService : Service() {
         bleEngine = BleEngine(applicationContext, serviceScope, secureLink)
         wifiEngine = WifiEngine(applicationContext, serviceScope, secureLink)
         router = SyncRouter(bleEngine, wifiEngine, serviceScope)
+        restoreReceivedFiles()
 
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
         clipboardManager?.addPrimaryClipChangedListener(clipboardListener)
@@ -155,6 +156,36 @@ class RadioSyncService : Service() {
                 }
             }
         }
+    }
+
+    /** Restore received files after a process restart without persisting clipboard text. */
+    private fun restoreReceivedFiles() {
+        val directory = java.io.File(filesDir, "received_files")
+        val storedFiles = directory.listFiles()
+            ?.asSequence()
+            ?.filter { it.isFile && it.length() >= 0L }
+            ?.sortedByDescending { it.lastModified() }
+            ?.take(historyLimit)
+            ?.map { file ->
+                val visibleName = if (file.name.length > 37 &&
+                    file.name[36] == '-') file.name.substring(37) else file.name
+                val ext = visibleName.substringAfterLast('.', "")
+                val type = android.webkit.MimeTypeMap.getSingleton()
+                    .getMimeTypeFromExtension(ext.lowercase()) ?: "application/octet-stream"
+                Payload.File(
+                    id = if (file.name.length >= 36) file.name.take(36)
+                        else java.util.UUID.randomUUID().toString(),
+                    timestamp = file.lastModified(),
+                    fileName = visibleName,
+                    mimeType = type,
+                    sizeBytes = file.length(),
+                    localPath = file.absolutePath,
+                    senderDeviceName = "Saved to this device"
+                )
+            }
+            ?.toList()
+            ?: emptyList()
+        _history.value = storedFiles
     }
 
     private fun showFileReceivedNotification(file: Payload.File) {
