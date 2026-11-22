@@ -25,8 +25,8 @@ All communications occur over standard local RF interfaces (`Bluetooth LE` and `
 ## 🚀 Key Features
 
 - **⚡ Dual-Engine Hybrid Routing**:
-  - **BLE GATT Transport**: Ultra low-power background transport for small text snippets, clipboard sync, and signaling (≤ 20 KB).
-  - **Wi-Fi Direct (P2P) Transport**: High-throughput multi-megabyte direct Wi-Fi channel for files, photos, audio, and large payloads.
+  - **BLE GATT Transport**: Low-power text transfer with authenticated encryption, chunk reassembly, verified receiver acknowledgements and retries (up to 20 KB on the wire).
+  - **Wi-Fi Direct (P2P) Transport**: Peer-to-peer TCP for encrypted text and files up to 512 MB with per-chunk authentication and receiver confirmation.
 - **📱 Background Sync Service**:
   - Runs a foreground persistent Android Service (`connectedDevice`) maintaining radio liveness and listening for incoming payloads.
 - **👥 Active Peer Discovery & Manual Connect**:
@@ -39,23 +39,17 @@ All communications occur over standard local RF interfaces (`Bluetooth LE` and `
 
 ---
 
-## 🔒 Security & Privacy Notice
+## 🔒 Security & Privacy
 
-> [!WARNING]
-> **Do not use RadioClip to exchange passwords, tokens, or sensitive files yet.**
-> The current application protocol does **not** authenticate peers, establish a trusted-device list, or provide end-to-end encryption. Bluetooth and Wi-Fi Direct radio connections are not a substitute for application-level authentication. Treat this as a development prototype.
+> [!IMPORTANT]
+> **All devices must run protocol v2 and enter the same 16+ character pairing phrase (letters and numbers).** Enter the phrase on both devices in the dashboard. Earlier builds are not protocol-compatible.
 >
-> **Automatic clipboard sync is disabled by default.** It requires an explicit opt-in and can be unreliable on Android 10+ because Android restricts background clipboard access. You can still send text manually and copy received text in the app.
->
-> Received files are limited to 512 MB and checked for truncation, but **cryptographic integrity verification and receiver acknowledgments are not implemented yet.** A "Sent" badge confirms only that the local transport completed without raising an error, not that the recipient stored the data.
-
-
-
-- **No Secrets or Credentials**: This repository contains no API keys, private keys, keystores, backend URLs, or credentials.
-- **Zero Internet Requirement**: The app operates strictly peer-to-peer over local radios. No telemetry, crash reporting, or external outbound network calls exist in the codebase.
-- **Standard Local Permissions**: BLE and Wi-Fi Direct permissions specify `neverForLocation` where supported on modern Android versions (Android 12+ / API 31+).
-
----
+> - Text and file contents are encrypted and authenticated with AES-256-GCM. A shared key is derived using PBKDF2-HMAC-SHA256; Android Keystore protects its on-device storage. The phrase is never sent over BLE or Wi-Fi Direct.
+> - Both transports use receiver acknowledgements and bounded retry attempts; Wi-Fi file chunks are authenticated individually and saved only after all chunks pass verification.
+> - **The pairing phrase is shared-group authentication, not verified device identity.** Anyone with the phrase could join the group. Wi-Fi file names, MIME types and sizes are not hidden from the peer network.
+> - This is still a development build. It has not been validated on two physical devices, and it has no formal security audit. Avoid transmitting sensitive credentials until you have tested and evaluated the risks.
+> - Automatic clipboard sync is off by default and requires opt-in. Android 10+ restricts background clipboard reads, so automatic sync may only work while the app is in the foreground. Manual text and file sending remains available.
+> - No accounts, servers, telemetry or external analytics are used. The Android `INTERNET` permission is required for local TCP sockets, not cloud access.
 
 ## 📦 Building & Generating APK
 
@@ -105,17 +99,19 @@ app/src/main/java/com/almog/radioclip/
 └── ui/
     ├── DashboardScreen.kt   # Jetpack Compose dashboard UI
     └── theme/               # Material 3 styling & tokens
+security/
+└── SecureLink.kt            # Pairing phrase, Keystore, AES-GCM, BLE acknowledgement MAC
 ```
 
 ---
 
 ## 🧪 Verification
 
-The `.github/workflows/android-ci.yml` workflow runs unit tests and builds a debug APK on pushes and pull requests.
+The `.github/workflows/android-ci.yml` workflow runs unit tests, builds a debug APK and uploads an artifact named **RadioClip-debug-apk** on successful runs. Download the artifact ZIP from the latest successful workflow run and extract `app-debug.apk` to install. Debug builds are not Play Store releases.
 
 For a meaningful two-device release test, exercise:
-- Manual BLE discovery, connect, and text transfer in **both** directions, including long text, Unicode, and reconnection.
-- Wi-Fi Direct file transfers both ways, a truncated stream, an invalid filename, and the 512 MB limit.
+- Enter the same phrase on two phones, confirm encrypted BLE discovery/connect and text transfer in **both** directions, including Unicode, retries and reconnection. Verify that a wrong phrase cannot receive messages.
+- Wi-Fi Direct encrypted text and file transfer both ways, correct pairing before/after connection, no duplicate deliveries after retries, and the 512 MB limit.
 - Android permission denial, Bluetooth/Wi-Fi toggling, app rotation, and service shutdown.
 - Clipboard opt-in behavior in foreground and background, including Android 10+ clipboard restrictions.
 
