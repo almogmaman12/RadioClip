@@ -50,7 +50,9 @@ All communications occur over standard local RF interfaces (`Bluetooth LE` and `
 > - Both transports use receiver acknowledgements and bounded retry attempts; Wi-Fi file chunks are authenticated individually and saved only after all chunks pass verification.
 > - **The pairing phrase is shared-group authentication, not verified device identity.** Anyone with the phrase could join the group. Wi-Fi file names, MIME types and sizes are not hidden from the peer network.
 > - This is still a development build. It has not been validated on two physical devices, and it has no formal security audit. Avoid transmitting sensitive credentials until you have tested and evaluated the risks.
-> - Automatic clipboard sync is off by default and requires opt-in. Android 10+ restricts background clipboard reads, so automatic sync may only work while the app is in the foreground. Manual text and file sending remains available.
+> - Clipboard sync is **off by default**. Android 10+ allows ordinary apps to read the clipboard only when they have input focus (or when they are the system's default keyboard). A foreground service is **not** an exception. When enabled, RadioClip detects new plain-text clipboard contents while its window is focused, and checks again when you return to it after copying in another app. It skips clips marked sensitive and retries a pending clipboard transfer when a peer reconnects.
+- To send text without returning first, use **Share → RadioClip** (or the **Process text** selection action where supported). This is an explicit Android-supported send, not background clipboard surveillance.
+- The UI reports **Watching**, **Paused**, **Sending**, **Not delivered**, or **Delivered**, and has a **Sync clipboard now** action. Incoming text remains available in Activity History with a **Copy text** button when your device restricts applying the received clipboard.
 > - No accounts, servers, telemetry or external analytics are used. The Android `INTERNET` permission is required for local TCP sockets, not cloud access.
 
 ## 📦 Building & Generating APK
