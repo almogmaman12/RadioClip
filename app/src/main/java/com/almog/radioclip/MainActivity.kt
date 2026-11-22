@@ -35,12 +35,19 @@ class MainActivity : ComponentActivity() {
     private var syncService: RadioSyncService? by mutableStateOf(RadioSyncService.activeInstance)
     private var isBound by mutableStateOf(false)
     private var pendingFilePayload: Payload.File? = null
+    private var pendingSharedText: String? = null
+    private var windowCurrentlyFocused = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as RadioSyncService.LocalBinder
             syncService = binder.getService()
             isBound = true
+            syncService?.setWindowFocused(windowCurrentlyFocused)
+            pendingSharedText?.let { shared ->
+                syncService?.sendPayload(Payload.Text(content = shared))
+                pendingSharedText = null
+            }
             pendingFilePayload?.let { file ->
                 syncService?.sendPayload(file)
                 pendingFilePayload = null
@@ -58,18 +65,60 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
+        handleExternalIntent(intent)
+    }
+
+    private fun handleExternalIntent(intent: Intent?) {
+        if (intent?.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
             triggerFilePicker = true
+            return
         }
+
+        // Sharesheet is the supported way to send from other apps without
+        // bypassing Android's clipboard privacy protections.
+        val shared = when (intent?.action) {
+            Intent.ACTION_SEND -> if (intent.type?.startsWith("text/") == true) {
+                intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+            } else null
+            Intent.ACTION_PROCESS_TEXT ->
+                intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()
+            else -> null
+        } ?: return
+        if (shared.isBlank()) return
+        if (shared.toByteArray(Charsets.UTF_8).size > 1024 * 1024) {
+            android.widget.Toast.makeText(
+                this, "Shared text is too large to send", android.widget.Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        if (syncService != null) {
+            syncService?.sendPayload(Payload.Text(content = shared))
+        } else {
+            pendingSharedText = shared
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        windowCurrentlyFocused = hasFocus
+        syncService?.setWindowFocused(hasFocus)
+    }
+
+    override fun onPause() {
+        syncService?.setWindowFocused(false)
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (windowCurrentlyFocused) syncService?.setWindowFocused(true)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        if (intent?.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
-            triggerFilePicker = true
-        }
+        handleExternalIntent(intent)
 
         setContent {
             // The interface is English-only for now; the system's Hebrew RTL
@@ -152,6 +201,8 @@ class MainActivity : ComponentActivity() {
                 val history = currentService?.history?.collectAsState()?.value ?: emptyList()
                 val clipboardSyncEnabled =
                     currentService?.clipboardSyncEnabled?.collectAsState()?.value ?: false
+                val clipboardSyncStatus =
+                    currentService?.clipboardSyncStatus?.collectAsState()?.value ?: "Off"
                 val pairingConfigured =
                     currentService?.secureLink?.configured?.collectAsState()?.value ?: false
                 val pairingError =
@@ -166,7 +217,9 @@ class MainActivity : ComponentActivity() {
                     connectedWifiPeers = connectedWifiPeers,
                     history = history,
                     clipboardSyncEnabled = clipboardSyncEnabled,
+                    clipboardSyncStatus = clipboardSyncStatus,
                     onClipboardSyncChange = { currentService?.setClipboardSyncEnabled(it) },
+                    onSyncClipboardNow = { currentService?.syncClipboardNow() },
                     pairingConfigured = pairingConfigured,
                     pairingError = pairingError,
                     onPairingPhrase = { currentService?.setPairingPhrase(it) },
