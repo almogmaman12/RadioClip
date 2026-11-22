@@ -67,8 +67,10 @@ class BleEngine(
 
     companion object {
         private const val TAG = "BleEngine"
-        val SERVICE_UUID: UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
-        val CHARACTERISTIC_UUID: UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+        // RadioClip-specific UUID. Do not use the generic Nordic UART service;
+        // other apps and BLE gadgets commonly advertise that UUID.
+        val SERVICE_UUID: UUID = UUID.fromString("C2E7D459-487A-4572-8492-6B3DFBB50316")
+        val CHARACTERISTIC_UUID: UUID = UUID.fromString("C2E7D45A-487A-4572-8492-6B3DFBB50316")
         private const val REQUESTED_MTU = 512
         private const val DEFAULT_CHUNK_SIZE = 500
         private const val DEFAULT_MTU = 23
