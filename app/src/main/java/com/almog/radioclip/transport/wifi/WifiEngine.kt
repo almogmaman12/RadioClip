@@ -133,6 +133,7 @@ class WifiEngine(
                     if (networkInfo?.isConnected == true || directP2pInfo?.groupFormed == true) {
                         requestConnectionInfo()
                     } else {
+                        closeServerSocket()
                         if (_connectedPeers.value.isNotEmpty()) {
                             _state.value = TransportState.DISCONNECTED
                         } else if (_state.value == TransportState.CONNECTING) {
