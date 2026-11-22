@@ -279,7 +279,7 @@ fun DashboardScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            "No synced items yet.\nCopied text or sent files will appear here automatically.",
+                            "No transfers yet.\nConnect a peer, then send text or a file.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.outline
                         )
@@ -498,13 +498,21 @@ fun PayloadItem(payload: Payload) {
                     }
 
                     // Direction badge (Sent vs Received)
-                    val dirColor = if (payload.isOutgoing) Color(0xFF2E7D32) else Color(0xFFE65100)
+                    val dirColor = when {
+                        payload.isFailed -> Color(0xFFD32F2F)
+                        payload.isOutgoing -> Color(0xFF2E7D32)
+                        else -> Color(0xFFE65100)
+                    }
                     Surface(
                         color = dirColor.copy(alpha = 0.15f),
                         shape = RoundedCornerShape(4.dp)
                     ) {
                         Text(
-                            text = if (payload.isOutgoing) "SENT" else "RECEIVED",
+                            text = when {
+                                payload.isFailed -> "FAILED"
+                                payload.isOutgoing -> "SENT"
+                                else -> "RECEIVED"
+                            },
                             color = dirColor,
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
@@ -568,7 +576,7 @@ fun PayloadItem(payload: Payload) {
                             )
                         }
 
-                        // Open File action button
+                        // Only received files already saved locally are available to open.
                         FilledTonalButton(
                             onClick = {
                                 openFileIntent(context, payload)
