@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -30,6 +31,10 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 
 class RadioSyncService : Service() {
@@ -106,17 +111,69 @@ class RadioSyncService : Service() {
     private val _clipboardSyncEnabled = MutableStateFlow(false)
     val clipboardSyncEnabled: StateFlow<Boolean> = _clipboardSyncEnabled.asStateFlow()
 
+    private val _clipboardSyncStatus = MutableStateFlow("Off")
+    val clipboardSyncStatus: StateFlow<String> = _clipboardSyncStatus.asStateFlow()
+
+    private var clipboardManager: ClipboardManager? = null
+    private var windowFocused = false
+    private var clipboardListenerRegistered = false
+    private var lastDeliveredClipboardText: String? = null
+    private var lastRemoteClipboardText: String? = null
+    private var pendingLocalClipboardText: String? = null
+    private val clipboardSendMutex = Mutex()
+
+    private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
+        // Clipboard reads are permitted only while an activity has focus (Android 10+).
+        if (windowFocused) inspectFocusedClipboard()
+    }
+
     fun setClipboardSyncEnabled(enabled: Boolean) {
         _clipboardSyncEnabled.value = enabled
         getSharedPreferences("radioclip", MODE_PRIVATE).edit()
             .putBoolean("clipboard_sync_enabled", enabled).apply()
+
+        if (!enabled) {
+            pendingLocalClipboardText = null
+            _clipboardSyncStatus.value = "Off"
+        } else {
+            _clipboardSyncStatus.value = if (windowFocused) {
+                "Watching clipboard while RadioClip is in front"
+            } else {
+                "Paused: Android blocks background clipboard reads"
+            }
+            if (windowFocused) inspectFocusedClipboard()
+        }
     }
 
-    private var clipboardManager: ClipboardManager? = null
-    private var lastSyncedClipboardText: String? = null
+    /** Called by MainActivity only while its Android window really has input focus. */
+    fun setWindowFocused(focused: Boolean) {
+        windowFocused = focused
+        val manager = clipboardManager ?: return
+        if (focused && !clipboardListenerRegistered) {
+            manager.addPrimaryClipChangedListener(clipboardListener)
+            clipboardListenerRegistered = true
+        } else if (!focused && clipboardListenerRegistered) {
+            manager.removePrimaryClipChangedListener(clipboardListener)
+            clipboardListenerRegistered = false
+        }
+        if (_clipboardSyncEnabled.value) {
+            if (focused) {
+                _clipboardSyncStatus.value = "Watching clipboard while RadioClip is in front"
+                inspectFocusedClipboard()
+                flushPendingClipboard()
+            } else {
+                _clipboardSyncStatus.value = "Paused: Android blocks background clipboard reads"
+            }
+        }
+    }
 
-    private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
-        handleClipboardChanged()
+    fun syncClipboardNow() {
+        if (!windowFocused) {
+            _clipboardSyncStatus.value = "Bring RadioClip to the foreground to read clipboard"
+            return
+        }
+        inspectFocusedClipboard()
+        flushPendingClipboard()
     }
 
     inner class LocalBinder : Binder() {
@@ -137,7 +194,24 @@ class RadioSyncService : Service() {
         restoreReceivedFiles()
 
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        clipboardManager?.addPrimaryClipChangedListener(clipboardListener)
+        _clipboardSyncStatus.value = if (_clipboardSyncEnabled.value) {
+            "Paused: Android blocks background clipboard reads"
+        } else "Off"
+
+        // A copied item that failed while disconnected is kept for retry when a
+        // peer becomes available, rather than silently being marked as synced.
+        serviceScope.launch {
+            combine(
+                bleEngine.connectedPeers,
+                wifiEngine.connectedPeers,
+                secureLink.configured,
+                _clipboardSyncEnabled
+            ) { ble, wifi, paired, enabled ->
+                enabled && paired && (ble.isNotEmpty() || wifi.isNotEmpty())
+            }.distinctUntilChanged().collect { connected ->
+                if (connected) flushPendingClipboard()
+            }
+        }
 
         // Observe incoming payloads from peers
         serviceScope.launch {
@@ -253,24 +327,83 @@ class RadioSyncService : Service() {
         return START_STICKY
     }
 
-    private fun handleClipboardChanged() {
+    /** Only reads plain text while the RadioClip UI has input focus. */
+    private fun inspectFocusedClipboard() {
+        if (!windowFocused || !_clipboardSyncEnabled.value || !secureLink.configured.value) return
+        val manager = clipboardManager ?: return
+        try {
+            val clip = manager.primaryClip ?: return
+            val description = clip.description
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE) == true
+            ) {
+                _clipboardSyncStatus.value = "Sensitive clipboard skipped"
+                return
+            }
+            if (!description.hasMimeType(ClipDescription.MIMETYPE_TEXT_PLAIN) &&
+                !description.hasMimeType(ClipDescription.MIMETYPE_TEXT_HTML)
+            ) return
+            if (clip.itemCount == 0) return
+            val text = clip.getItemAt(0).text?.toString() ?: return
+            if (text.isBlank() || text == lastDeliveredClipboardText ||
+                text == lastRemoteClipboardText || text == pendingLocalClipboardText
+            ) return
+            if (text.toByteArray(Charsets.UTF_8).size > 1024 * 1024) {
+                _clipboardSyncStatus.value = "Clipboard text exceeds 1 MB; use file sharing"
+                return
+            }
+            pendingLocalClipboardText = text
+            flushPendingClipboard()
+        } catch (e: SecurityException) {
+            _clipboardSyncStatus.value = "Clipboard access denied by Android"
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not inspect clipboard", e)
+            _clipboardSyncStatus.value = "Unable to read clipboard"
+        }
+    }
+
+    /** Transport completion must be confirmed before a copy is considered synced. */
+    private fun flushPendingClipboard() {
         if (!_clipboardSyncEnabled.value || !secureLink.configured.value) return
-        val clip = clipboardManager?.primaryClip ?: return
-        if (clip.itemCount > 0) {
-            val text = clip.getItemAt(0)?.text?.toString()
-            if (!text.isNullOrBlank() && text != lastSyncedClipboardText) {
-                lastSyncedClipboardText = text
-                Log.d(TAG, "Local clipboard changed")
-                sendPayload(Payload.Text(content = text, isOutgoing = true))
+        serviceScope.launch {
+            clipboardSendMutex.withLock {
+                while (_clipboardSyncEnabled.value && secureLink.configured.value) {
+                    val text = pendingLocalClipboardText ?: break
+                    _clipboardSyncStatus.value = "Sending clipboard..."
+                    val payload = Payload.Text(content = text, isOutgoing = true)
+                    val result = router.route(payload)
+                    val transport = result.getOrNull() ?: payload.transportType
+                    _history.value = (listOf(
+                        payload.copy(
+                            transportType = transport,
+                            isFailed = result.isFailure
+                        )
+                    ) + _history.value).take(historyLimit)
+                    if (result.isSuccess) {
+                        lastDeliveredClipboardText = text
+                        if (pendingLocalClipboardText == text) pendingLocalClipboardText = null
+                        _clipboardSyncStatus.value = "Clipboard delivered to peer"
+                    } else {
+                        _clipboardSyncStatus.value = "Not delivered: connect a paired device, then retry"
+                        Log.w(TAG, "Clipboard transfer not delivered: ${result.exceptionOrNull()?.message}")
+                        break
+                    }
+                }
             }
         }
     }
 
     private fun applyToLocalClipboard(text: String) {
-        lastSyncedClipboardText = text
-        val clip = ClipData.newPlainText("RadioClip Sync", text)
+        lastRemoteClipboardText = text
+        // A foreground service isn't a privileged clipboard-reading service.
+        // Writing can also vary by Android implementation; received text remains
+        // in history with the explicit Copy action if this fails.
         android.os.Handler(mainLooper).post {
-            clipboardManager?.setPrimaryClip(clip)
+            try {
+                clipboardManager?.setPrimaryClip(ClipData.newPlainText("RadioClip Sync", text))
+            } catch (e: Exception) {
+                Log.w(TAG, "Incoming clipboard cannot be applied automatically", e)
+            }
         }
     }
 
@@ -383,7 +516,10 @@ class RadioSyncService : Service() {
         if (activeInstance == this) {
             activeInstance = null
         }
-        clipboardManager?.removePrimaryClipChangedListener(clipboardListener)
+        if (clipboardListenerRegistered) {
+            clipboardManager?.removePrimaryClipChangedListener(clipboardListener)
+            clipboardListenerRegistered = false
+        }
         // Let transport cleanup complete before cancelling the service scope.
         serviceScope.launch {
             try {
