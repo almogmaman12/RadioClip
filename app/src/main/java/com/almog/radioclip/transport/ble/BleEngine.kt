@@ -54,6 +54,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -701,35 +702,60 @@ class BleEngine(
                 }
 
                 clients.forEach { gatt ->
-                    sendChunksOverClient(gatt, data, payloadIdHash)
+                    sendWithDeliveryAck(gatt.device.address, payloadIdHash) {
+                        sendChunksOverClient(gatt, data, payloadIdHash)
+                    }
                 }
                 if (serverDevices.isNotEmpty()) {
                     val characteristic = gattServer?.getService(SERVICE_UUID)
                         ?.getCharacteristic(CHARACTERISTIC_UUID)
                         ?: error("Server characteristic not found")
                     serverDevices.forEach { device ->
-                        sendChunksOverServer(device, characteristic, data, payloadIdHash)
+                        sendWithDeliveryAck(device.address, payloadIdHash) {
+                            sendChunksOverServer(device, characteristic, data, payloadIdHash)
+                        }
                     }
                 }
             }
         }
     }
 
-    private suspend fun sendChunksOverClient(gatt: BluetoothGatt, data: ByteArray, payloadIdHash: Int) {
-        val mtu = clientMtuMap[gatt.device.address] ?: DEFAULT_MTU
-        // ATT overhead (3 bytes) plus RadioClip's chunk header (8 bytes).
-        val chunkSize = (mtu - 11).coerceIn(1, DEFAULT_CHUNK_SIZE)
-        val totalChunks = ((data.size + chunkSize - 1) / chunkSize).coerceAtLeast(1)
+    private suspend fun sendWithDeliveryAck(
+        address: String,
+        hash: Int,
+        transfer: suspend () -> Unit
+    ) {
+        val key = "$address-$hash"
+        val acknowledgement = CompletableDeferred<Unit>()
+        check(pendingDeliveryAcks.putIfAbsent(key, acknowledgement) == null) {
+            "This BLE transfer is already in progress"
+        }
+        try {
+            repeat(3) { attempt ->
+                transfer()
+                try {
+                    withTimeout(7_000L) { acknowledgement.await() }
+                    return
+                } catch (e: TimeoutCancellationException) {
+                    if (attempt == 2) {
+                        throw IllegalStateException("Peer did not acknowledge BLE delivery", e)
+                    }
+                    delay((attempt + 1) * 300L)
+                }
+            }
+        } finally {
+            pendingDeliveryAcks.remove(key, acknowledgement)
+        }
+    }
+
+    private suspend fun writeClientPacket(gatt: BluetoothGatt, packet: ByteArray) {
+        val address = gatt.device.address
         val characteristic = gatt.getService(SERVICE_UUID)
             ?.getCharacteristic(CHARACTERISTIC_UUID)
-            ?: error("GATT characteristic unavailable for ${gatt.device.address}")
-
-        for (index in 0 until totalChunks) {
-            val start = index * chunkSize
-            val end = (start + chunkSize).coerceAtMost(data.size)
-            val packet = makePacket(payloadIdHash, totalChunks, index, data.copyOfRange(start, end))
+            ?: error("GATT characteristic unavailable for $address")
+        clientOperationLocks.getOrPut(address) { Mutex() }.withLock {
             val ack = CompletableDeferred<Int>()
-            pendingClientWrites[gatt.device.address] = ack
+            pendingClientWrites[address] = ack
             try {
                 val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     gatt.writeCharacteristic(
@@ -747,28 +773,21 @@ class BleEngine(
                     "BLE write failed"
                 }
             } finally {
-                pendingClientWrites.remove(gatt.device.address, ack)
+                pendingClientWrites.remove(address, ack)
             }
         }
     }
 
-    private suspend fun sendChunksOverServer(
+    private suspend fun notifyServerPacket(
         device: BluetoothDevice,
         characteristic: BluetoothGattCharacteristic,
-        data: ByteArray,
-        payloadIdHash: Int
+        packet: ByteArray
     ) {
+        val address = device.address
         val server = gattServer ?: error("BLE GATT server is closed")
-        val mtu = clientMtuMap[device.address] ?: DEFAULT_MTU
-        val chunkSize = (mtu - 11).coerceIn(1, DEFAULT_CHUNK_SIZE)
-        val totalChunks = ((data.size + chunkSize - 1) / chunkSize).coerceAtLeast(1)
-
-        for (index in 0 until totalChunks) {
-            val start = index * chunkSize
-            val end = (start + chunkSize).coerceAtMost(data.size)
-            val packet = makePacket(payloadIdHash, totalChunks, index, data.copyOfRange(start, end))
+        serverOperationLocks.getOrPut(address) { Mutex() }.withLock {
             val ack = CompletableDeferred<Int>()
-            pendingServerNotifications[device.address] = ack
+            pendingServerNotifications[address] = ack
             try {
                 val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     server.notifyCharacteristicChanged(device, characteristic, false, packet) ==
@@ -784,8 +803,61 @@ class BleEngine(
                     "BLE notification failed"
                 }
             } finally {
-                pendingServerNotifications.remove(device.address, ack)
+                pendingServerNotifications.remove(address, ack)
             }
+        }
+    }
+
+    private suspend fun sendChunksOverClient(gatt: BluetoothGatt, data: ByteArray, hash: Int) {
+        val mtu = clientMtuMap[gatt.device.address] ?: DEFAULT_MTU
+        val chunkSize = (mtu - 11).coerceIn(1, DEFAULT_CHUNK_SIZE)
+        val count = ((data.size + chunkSize - 1) / chunkSize).coerceAtLeast(1)
+        for (index in 0 until count) {
+            val start = index * chunkSize
+            val end = (start + chunkSize).coerceAtMost(data.size)
+            writeClientPacket(gatt, makePacket(hash, count, index, data.copyOfRange(start, end)))
+        }
+    }
+
+    private suspend fun sendChunksOverServer(
+        device: BluetoothDevice,
+        characteristic: BluetoothGattCharacteristic,
+        data: ByteArray,
+        hash: Int
+    ) {
+        val mtu = clientMtuMap[device.address] ?: DEFAULT_MTU
+        val chunkSize = (mtu - 11).coerceIn(1, DEFAULT_CHUNK_SIZE)
+        val count = ((data.size + chunkSize - 1) / chunkSize).coerceAtLeast(1)
+        for (index in 0 until count) {
+            val start = index * chunkSize
+            val end = (start + chunkSize).coerceAtMost(data.size)
+            notifyServerPacket(device, characteristic,
+                makePacket(hash, count, index, data.copyOfRange(start, end)))
+        }
+    }
+
+    private fun ackInput(hash: Int): ByteArray =
+        ByteBuffer.allocate(18).apply {
+            put("RadioClip ACK v2".toByteArray(Charsets.UTF_8))
+            putInt(hash)
+        }.array()
+
+    private suspend fun sendAcknowledgement(address: String, hash: Int) {
+        val signature = secureLink.authenticationTag(ackInput(hash))
+        val packet = makePacket(hash, 0, 0, signature)
+        val device = serverConnectedDevices[address]
+        val characteristic = gattServer?.getService(SERVICE_UUID)
+            ?.getCharacteristic(CHARACTERISTIC_UUID)
+        try {
+            when {
+                device != null && subscribedServerDevices.contains(address) && characteristic != null ->
+                    notifyServerPacket(device, characteristic, packet)
+                activeGattClients[address] != null && readyClientAddresses.contains(address) ->
+                    writeClientPacket(activeGattClients[address]!!, packet)
+                else -> Log.w(TAG, "No reverse BLE channel for delivery acknowledgement")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "BLE delivery acknowledgement could not be sent", e)
         }
     }
 
@@ -803,10 +875,22 @@ class BleEngine(
         val hash = buffer.int
         val total = buffer.short.toInt() and 0xFFFF
         val index = buffer.short.toInt() and 0xFFFF
-        if (total !in 1..MAX_CHUNKS || index >= total) return
-
         val bytes = ByteArray(packet.size - 8)
         buffer.get(bytes)
+
+        if (total == 0 && index == 0) {
+            // Delivery acknowledgments are small enough for the minimum GATT MTU.
+            try {
+                val expected = secureLink.authenticationTag(ackInput(hash))
+                if (MessageDigest.isEqual(expected, bytes)) {
+                    pendingDeliveryAcks["$senderAddress-$hash"]?.complete(Unit)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Rejected unauthenticated BLE acknowledgement", e)
+            }
+            return
+        }
+        if (total !in 1..MAX_CHUNKS || index >= total) return
         val buffers = incomingPacketBuffers.getOrPut(senderAddress) { ConcurrentHashMap() }
         val now = System.currentTimeMillis()
         buffers.entries.removeIf { now - it.value.createdAt > ASSEMBLY_TIMEOUT_MS }
@@ -841,13 +925,19 @@ class BleEngine(
                 try {
                     val aad = ByteBuffer.allocate(4).putInt(hash).array()
                     val cleartext = secureLink.open(complete, aad)
-                    _incomingPayloads.emit(
-                        Payload.Text(
-                            transportType = TransportType.BLE_GATT,
-                            senderDeviceName = name,
-                            content = String(cleartext, Charsets.UTF_8)
+                    val receivedKey = "$senderAddress-$hash"
+                    val now = System.currentTimeMillis()
+                    recentReceivedHashes.entries.removeIf { now - it.value > 10 * 60_000L }
+                    if (recentReceivedHashes.putIfAbsent(receivedKey, now) == null) {
+                        _incomingPayloads.emit(
+                            Payload.Text(
+                                transportType = TransportType.BLE_GATT,
+                                senderDeviceName = name,
+                                content = String(cleartext, Charsets.UTF_8)
+                            )
                         )
-                    )
+                    }
+                    sendAcknowledgement(senderAddress, hash)
                 } catch (e: Exception) {
                     Log.w(TAG, "Rejected unauthenticated or damaged BLE message", e)
                 }
