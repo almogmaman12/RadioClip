@@ -115,11 +115,11 @@ class RadioSyncService : Service() {
     val clipboardSyncStatus: StateFlow<String> = _clipboardSyncStatus.asStateFlow()
 
     private var clipboardManager: ClipboardManager? = null
-    private var windowFocused = false
+    @Volatile private var windowFocused = false
     private var clipboardListenerRegistered = false
-    private var lastDeliveredClipboardText: String? = null
-    private var lastRemoteClipboardText: String? = null
-    private var pendingLocalClipboardText: String? = null
+    @Volatile private var lastDeliveredClipboardText: String? = null
+    @Volatile private var lastRemoteClipboardText: String? = null
+    @Volatile private var pendingLocalClipboardText: String? = null
     private val clipboardSendMutex = Mutex()
 
     private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
