@@ -1,6 +1,8 @@
 package com.almog.radioclip.ui
 
 import android.content.Context
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -34,6 +36,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -69,6 +72,8 @@ fun DashboardScreen(
     connectedBlePeers: List<PeerDevice>,
     connectedWifiPeers: List<PeerDevice>,
     history: List<Payload>,
+    clipboardSyncEnabled: Boolean,
+    onClipboardSyncChange: (Boolean) -> Unit,
     onConnectPeer: (transportType: TransportType, peerId: String) -> Unit,
     onSendText: (String) -> Unit,
     onSendFile: (name: String, mimeType: String, sizeBytes: Long, uriString: String) -> Unit,
@@ -202,6 +207,38 @@ fun DashboardScreen(
                     transportType = TransportType.WIFI_DIRECT_SOCKET,
                     onConnect = { onConnectPeer(TransportType.WIFI_DIRECT_SOCKET, it) }
                 )
+            }
+
+            // Android restricts background clipboard reads, and peer traffic is not
+            // authenticated yet. Require clear opt-in for automatic clipboard sync.
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Automatic clipboard sync", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    if (clipboardSyncEnabled) "Enabled" else "Off by default",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            Switch(checked = clipboardSyncEnabled, onCheckedChange = onClipboardSyncChange)
+                        }
+                        Text(
+                            "Experimental. Nearby transfers are not encrypted or authenticated yet. " +
+                                "Enable only around devices you trust. Android 10+ also limits background clipboard access.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
 
             // Quick Send Clipboard Text Card
@@ -556,6 +593,19 @@ fun PayloadItem(payload: Payload) {
                         style = MaterialTheme.typography.bodyMedium,
                         fontFamily = FontFamily.Monospace
                     )
+                    if (!payload.isOutgoing) {
+                        OutlinedButton(
+                            onClick = {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                                    as? ClipboardManager
+                                clipboard?.setPrimaryClip(
+                                    ClipData.newPlainText("RadioClip", payload.content)
+                                )
+                            }
+                        ) {
+                            Text("Copy text")
+                        }
+                    }
                 }
                 is Payload.File -> {
                     Row(
