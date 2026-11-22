@@ -2,6 +2,7 @@ package com.almog.radioclip.ui
 
 import android.content.Context
 import android.content.ClipData
+import android.content.Intent
 import android.content.ClipboardManager
 import android.net.Uri
 import android.provider.OpenableColumns
@@ -89,9 +90,16 @@ fun DashboardScreen(
     var pairingPhrase by remember { mutableStateOf("") }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    it, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: SecurityException) {
+                // Some document providers cannot persist URI access.
+            }
             val (name, size) = queryFileMeta(context, it)
             val mime = context.contentResolver.getType(it) ?: "application/octet-stream"
             onSendFile(name, mime, size, it.toString())
@@ -344,7 +352,7 @@ fun DashboardScreen(
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 FilledTonalButton(
-                                    onClick = { filePickerLauncher.launch("*/*") },
+                                    onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
                                     enabled = pairingConfigured
                                 ) {
                                     Text("Pick File")
