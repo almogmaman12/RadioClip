@@ -79,11 +79,16 @@ class SecureLink(private val context: Context) {
             spec.clearPassword()
         }
         try {
-            val iv = ByteArray(IV_LENGTH).also(random::nextBytes)
+            // Android Keystore AES-GCM keys reject caller-provided IVs on encryption.
+            // Let the provider generate a fresh nonce and persist it alongside ciphertext.
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, localStorageKey(), GCMParameterSpec(TAG_BITS, iv))
+            cipher.init(Cipher.ENCRYPT_MODE, localStorageKey())
+            val iv = cipher.iv
+            check(iv.size == IV_LENGTH) { "Unexpected Android Keystore GCM IV size" }
             val encrypted = iv + cipher.doFinal(derived)
-            prefs.edit().putString(KEY_DATA, Base64.encodeToString(encrypted, Base64.NO_WRAP)).commit()
+            check(prefs.edit().putString(KEY_DATA, Base64.encodeToString(encrypted, Base64.NO_WRAP)).commit()) {
+                "Could not persist the pairing key"
+            }
             peerKey = SecretKeySpec(derived, "AES")
             _configured.value = true
         } finally {
