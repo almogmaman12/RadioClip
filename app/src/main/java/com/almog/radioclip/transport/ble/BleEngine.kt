@@ -632,32 +632,32 @@ class BleEngine(
                     activeGattClients.values.toList()
                 }
 
-                if (clients.isNotEmpty()) {
-                    clients.forEach { gatt ->
-                        sendChunksOverClient(gatt, data, payloadIdHash)
-                    }
-                    return@runCatching
-                }
-
-                // If not connected as client, send notification from GATT Server to server-connected devices
+                // A device may connect as a GATT client or as a server. Broadcast to
+                // both kinds, but avoid sending the same text twice to one address.
+                val clientAddresses = clients.map { it.device.address }.toSet()
                 val serverDevices = if (targetPeerId != null) {
                     listOfNotNull(serverConnectedDevices[targetPeerId])
                 } else {
                     serverConnectedDevices.values.toList()
-                }.filter { subscribedServerDevices.contains(it.address) }
+                }.filter {
+                    subscribedServerDevices.contains(it.address) &&
+                        it.address !in clientAddresses
+                }
+                check(clients.isNotEmpty() || serverDevices.isNotEmpty()) {
+                    "No connected BLE peers with a ready data channel"
+                }
 
+                clients.forEach { gatt ->
+                    sendChunksOverClient(gatt, data, payloadIdHash)
+                }
                 if (serverDevices.isNotEmpty()) {
-                    val service = gattServer?.getService(SERVICE_UUID)
-                    val characteristic = service?.getCharacteristic(CHARACTERISTIC_UUID)
+                    val characteristic = gattServer?.getService(SERVICE_UUID)
+                        ?.getCharacteristic(CHARACTERISTIC_UUID)
                         ?: error("Server characteristic not found")
-
                     serverDevices.forEach { device ->
                         sendChunksOverServer(device, characteristic, data, payloadIdHash)
                     }
-                    return@runCatching
                 }
-
-                error("No connected BLE peers available to send payload")
             }
         }
     }
