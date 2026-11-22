@@ -217,7 +217,7 @@ fun DashboardScreen(
                     title = "Wi-Fi Direct Peers",
                     peers = allWifiPeers,
                     connectedPeers = connectedWifiPeers,
-                    emptyText = "Searching for nearby Android Wi-Fi Direct devices...",
+                    emptyText = "Searching for nearby devices advertising RadioClip.\nInstall and open RadioClip on the other device, and enable Wi-Fi and Location.",
                     transportType = TransportType.WIFI_DIRECT_SOCKET,
                     onConnect = { onConnectPeer(TransportType.WIFI_DIRECT_SOCKET, it) }
                 )
@@ -254,7 +254,9 @@ fun DashboardScreen(
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(
-                                enabled = pairingPhrase.length >= 16,
+                                enabled = pairingPhrase.length >= 16 &&
+                                    pairingPhrase.any { it.isLetter() } &&
+                                    pairingPhrase.any { it.isDigit() },
                                 onClick = {
                                     onPairingPhrase(pairingPhrase)
                                     pairingPhrase = ""
