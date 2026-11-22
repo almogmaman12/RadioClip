@@ -68,9 +68,6 @@ class WifiEngine(
         private const val FILE_CHUNK = 64 * 1024
         private const val MAX_TEXT_BYTES = 1024 * 1024
         private const val CRYPTO_OVERHEAD = 28
-        private const val SERVICE_INSTANCE = "RadioClip"
-        private const val SERVICE_TYPE = "_radioclip._tcp"
-        private const val SERVICE_PROTOCOL = "2"
         private const val PEER_EXPIRY_MS = 90_000L
     }
 
@@ -110,6 +107,7 @@ class WifiEngine(
     private val radioClipSeenAt = ConcurrentHashMap<String, Long>()
     private var localRadioClipService: WifiP2pDnsSdServiceInfo? = null
     private var radioClipServiceRequest: WifiP2pDnsSdServiceRequest? = null
+    private var discoveryRegistrationInProgress = false
     private var discoveryRetryJob: Job? = null
     private val deliveredIds = ConcurrentHashMap<String, Long>()
 
@@ -274,6 +272,7 @@ class WifiEngine(
             p2p.removeGroup(ch, null)
         }
         radioClipServiceRequest = null
+        discoveryRegistrationInProgress = false
         localRadioClipService = null
         radioClipSeenAt.clear()
         discoveredDevices.clear()
@@ -297,25 +296,21 @@ class WifiEngine(
         p2p.setDnsSdResponseListeners(
             ch,
             WifiP2pManager.DnsSdServiceResponseListener { instance, serviceType, device ->
-                if (instance.equals(SERVICE_INSTANCE, ignoreCase = true) &&
-                    serviceType.startsWith(SERVICE_TYPE, ignoreCase = true)
-                ) {
+                if (RadioClipServiceIdentity.matchesService(instance, serviceType)) {
                     markRadioClipPeer(device)
                 }
             },
             WifiP2pManager.DnsSdTxtRecordListener { domain, record, device ->
-                if (domain.contains(SERVICE_TYPE, ignoreCase = true) &&
-                    record["protocol"] == SERVICE_PROTOCOL
-                ) {
+                if (RadioClipServiceIdentity.matchesRecord(domain, record)) {
                     markRadioClipPeer(device)
                 }
             }
         )
 
         val service = WifiP2pDnsSdServiceInfo.newInstance(
-            SERVICE_INSTANCE,
-            SERVICE_TYPE,
-            mapOf("protocol" to SERVICE_PROTOCOL, "port" to PORT.toString())
+            RadioClipServiceIdentity.INSTANCE,
+            RadioClipServiceIdentity.TYPE,
+            mapOf("protocol" to RadioClipServiceIdentity.PROTOCOL, "port" to PORT.toString())
         )
         localRadioClipService = service
         p2p.addLocalService(ch, service, object : WifiP2pManager.ActionListener {
@@ -375,14 +370,18 @@ class WifiEngine(
         if (_state.value == TransportState.IDLE) return
 
         if (radioClipServiceRequest == null) {
-            val request = WifiP2pDnsSdServiceRequest.newInstance(SERVICE_TYPE)
+            if (discoveryRegistrationInProgress) return
+            discoveryRegistrationInProgress = true
+            val request = WifiP2pDnsSdServiceRequest.newInstance(RadioClipServiceIdentity.TYPE)
             p2p.addServiceRequest(ch, request, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
+                    discoveryRegistrationInProgress = false
                     radioClipServiceRequest = request
                     searchRadioClipServices()
                 }
 
                 override fun onFailure(reason: Int) {
+                    discoveryRegistrationInProgress = false
                     Log.w(TAG, "Could not register RadioClip service search: $reason")
                 }
             })
