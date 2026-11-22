@@ -38,6 +38,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -110,6 +113,12 @@ class BleEngine(
     private val subscribedServerDevices = ConcurrentHashMap.newKeySet<String>()
     private val pendingClientWrites = ConcurrentHashMap<String, CompletableDeferred<Int>>()
     private val pendingServerNotifications = ConcurrentHashMap<String, CompletableDeferred<Int>>()
+    private val readyClientAddresses = ConcurrentHashMap.newKeySet<String>()
+    private val clientOperationLocks = ConcurrentHashMap<String, Mutex>()
+    private val serverOperationLocks = ConcurrentHashMap<String, Mutex>()
+    private val pendingDeliveryAcks = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
+    private val recentReceivedHashes = ConcurrentHashMap<String, Long>()
+    private val reconnectAttempts = ConcurrentHashMap<String, Int>()
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
@@ -270,6 +279,12 @@ class BleEngine(
         subscribedServerDevices.clear()
         pendingClientWrites.clear()
         pendingServerNotifications.clear()
+        readyClientAddresses.clear()
+        pendingDeliveryAcks.clear()
+        clientOperationLocks.clear()
+        serverOperationLocks.clear()
+        recentReceivedHashes.clear()
+        reconnectAttempts.clear()
         incomingPacketBuffers.clear()
         targetReconnectAddresses.clear()
         scannedDevicesMap.clear()
@@ -441,9 +456,15 @@ class BleEngine(
 
             targetReconnectAddresses.add(peerId)
             stopScanning()
-            connectToPeerDevice(device)
-            delay(1000)
-            startScanning()
+            try {
+                connectToPeerDevice(device)
+                val ready = withTimeoutOrNull(15_000L) {
+                    connectedPeers.first { peers -> peers.any { it.id == peerId } }
+                }
+                check(ready != null) { "BLE peer did not complete GATT connection within 15 seconds" }
+            } finally {
+                startScanning()
+            }
         }
     }
 
@@ -456,18 +477,21 @@ class BleEngine(
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 val name = getDeviceDisplayName(gatt.device, null)
 
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                     Log.d(TAG, "Connected to GATT Client: $address. Requesting MTU $REQUESTED_MTU")
                     try {
-                        gatt.requestMtu(REQUESTED_MTU)
-                    } catch (e: SecurityException) {
-                        Log.w(TAG, "SecurityException requesting MTU", e)
+                        if (!gatt.requestMtu(REQUESTED_MTU)) {
+                            gatt.discoverServices()
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "MTU request failed; attempting service discovery", e)
+                        gatt.discoverServices()
                     }
-                    targetReconnectAddresses.add(address)
-                    updateConnectedPeers(address, name, true)
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED ||
+                    status != BluetoothGatt.GATT_SUCCESS) {
                     Log.d(TAG, "Disconnected from GATT Client: $address")
                     activeGattClients.remove(address)
+                    readyClientAddresses.remove(address)
                     updateConnectedPeers(address, name, false)
                     try { gatt.close() } catch (e: Exception) { Log.w(TAG, "Gatt close error", e) }
                     triggerAutoReconnect(address)
@@ -494,21 +518,41 @@ class BleEngine(
                         Log.w(TAG, "Peer lacks the RadioClip GATT characteristic")
                         return
                     }
-                    // Notifications must be explicitly enabled on both sides of GATT.
-                    gatt.setCharacteristicNotification(characteristic, true)
-                    characteristic.getDescriptor(CCCD_UUID)?.let { descriptor ->
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            gatt.writeDescriptor(
-                                descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                            )
-                        } else {
-                            @Suppress("DEPRECATION")
-                            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                            @Suppress("DEPRECATION")
-                            gatt.writeDescriptor(descriptor)
-                        }
+                    // Do not report a ready client link until notifications are subscribed.
+                    if (!gatt.setCharacteristicNotification(characteristic, true)) {
+                        Log.w(TAG, "Could not enable RadioClip notifications")
+                        return
                     }
-                    _state.value = TransportState.CONNECTED
+                    val descriptor = characteristic.getDescriptor(CCCD_UUID)
+                    if (descriptor == null) {
+                        Log.w(TAG, "Peer has no notification descriptor")
+                        return
+                    }
+                    val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeDescriptor(
+                            descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        ) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        @Suppress("DEPRECATION")
+                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        @Suppress("DEPRECATION")
+                        gatt.writeDescriptor(descriptor)
+                    }
+                    if (!accepted) Log.w(TAG, "Peer rejected notification subscription")
+                }
+            }
+
+            override fun onDescriptorWrite(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int
+            ) {
+                if (descriptor.uuid == CCCD_UUID && status == BluetoothGatt.GATT_SUCCESS) {
+                    readyClientAddresses.add(gatt.device.address)
+                    reconnectAttempts.remove(gatt.device.address)
+                    updateConnectedPeers(
+                        gatt.device.address, getDeviceDisplayName(gatt.device, null), true
+                    )
                 }
             }
 
@@ -563,13 +607,19 @@ class BleEngine(
 
     private fun triggerAutoReconnect(address: String) {
         if (!targetReconnectAddresses.contains(address)) return
+        val attempts = reconnectAttempts.merge(address, 1) { old, one -> old + one } ?: 1
+        if (attempts > 3) {
+            Log.w(TAG, "Stopped automatic BLE reconnection after 3 unsuccessful attempts")
+            targetReconnectAddresses.remove(address)
+            return
+        }
         scope.launch {
-            delay(3000)
+            delay(3000L * attempts)
             if (activeGattClients.containsKey(address) || _connectedPeers.value.any { it.id == address }) {
                 return@launch
             }
             scannedDevicesMap[address]?.let { device ->
-                Log.d(TAG, "Triggering auto-reconnect to $address")
+                Log.d(TAG, "Retry BLE connection attempt $attempts")
                 connectToPeerDevice(device)
             }
         }
@@ -633,7 +683,7 @@ class BleEngine(
                     listOfNotNull(activeGattClients[targetPeerId])
                 } else {
                     activeGattClients.values.toList()
-                }
+                }.filter { readyClientAddresses.contains(it.device.address) }
 
                 // A device may connect as a GATT client or as a server. Broadcast to
                 // both kinds, but avoid sending the same text twice to one address.
