@@ -131,6 +131,10 @@ class MainActivity : ComponentActivity() {
                 val history = currentService?.history?.collectAsState()?.value ?: emptyList()
                 val clipboardSyncEnabled =
                     currentService?.clipboardSyncEnabled?.collectAsState()?.value ?: false
+                val pairingConfigured =
+                    currentService?.secureLink?.configured?.collectAsState()?.value ?: false
+                val pairingError =
+                    currentService?.pairingError?.collectAsState()?.value
 
                 DashboardScreen(
                     bleState = bleState,
@@ -142,6 +146,10 @@ class MainActivity : ComponentActivity() {
                     history = history,
                     clipboardSyncEnabled = clipboardSyncEnabled,
                     onClipboardSyncChange = { currentService?.setClipboardSyncEnabled(it) },
+                    pairingConfigured = pairingConfigured,
+                    pairingError = pairingError,
+                    onPairingPhrase = { currentService?.setPairingPhrase(it) },
+                    onForgetPairing = { currentService?.forgetPairingPhrase() },
                     onConnectPeer = { transportType, peerId ->
                         currentService?.connectToPeer(transportType, peerId)
                     },
