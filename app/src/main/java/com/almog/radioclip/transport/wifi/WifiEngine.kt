@@ -308,7 +308,7 @@ class WifiEngine(
         val name = device.deviceName?.lowercase() ?: ""
         val primaryType = device.primaryDeviceType?.lowercase() ?: ""
 
-        val excludedKeywords = listOf("tv", "bravia", "samsung", "lg webos", "roku", "printer", "chromecast", "display", "fridge")
+        val excludedKeywords = listOf("bravia", "webos", "roku", "printer", "chromecast", "fridge")
         if (excludedKeywords.any { name.contains(it) }) return true
 
         if (primaryType.startsWith("7-") || primaryType.startsWith("3-") || primaryType.startsWith("8-")) {
@@ -389,20 +389,21 @@ class WifiEngine(
         val peers = mutableListOf<PeerDevice>()
         val connectedMac = pendingConnectMac
 
-        if (!isGroupOwner && connectedMac != null) {
-            val device = discoveredDevices[connectedMac]
+        if (!isGroupOwner) {
+            val device = connectedMac?.let { discoveredDevices[it] }
             val peerName = device?.deviceName?.takeIf { it.isNotBlank() }
                 ?: "Wi-Fi Direct GO ($goAddress)"
+            val peerId = connectedMac ?: goAddress ?: "p2p_group"
             peers.add(PeerDevice(
-                id = connectedMac,
+                id = peerId,
                 name = peerName,
                 transportType = TransportType.WIFI_DIRECT_SOCKET,
                 isConnected = true
             ))
             val existing = _discoveredPeers.value.toMutableList()
-            val idx = existing.indexOfFirst { it.id == connectedMac }
+            val idx = existing.indexOfFirst { it.id == peerId }
             if (idx < 0) {
-                existing.add(PeerDevice(id = connectedMac, name = peerName,
+                existing.add(PeerDevice(id = peerId, name = peerName,
                     transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
             } else {
                 existing[idx] = existing[idx].copy(isConnected = true)
@@ -431,6 +432,12 @@ class WifiEngine(
      * This causes the GO's ServerSocket to accept the connection and register our IP address,
      * which the GO needs to send data back to this client device.
      */
+    fun onPairingChanged() {
+        if (!isGroupOwner && _state.value == TransportState.CONNECTED) {
+            sendHelloToGroupOwner(groupOwnerAddress)
+        }
+    }
+
     private fun sendHelloToGroupOwner(goAddress: String?) {
         if (goAddress.isNullOrBlank() || !secureLink.configured.value) return
         scope.launch(Dispatchers.IO) {
