@@ -837,7 +837,7 @@ class BleEngine(
     }
 
     private fun ackInput(hash: Int): ByteArray =
-        ByteBuffer.allocate(18).apply {
+        ByteBuffer.allocate(20).apply {
             put("RadioClip ACK v2".toByteArray(Charsets.UTF_8))
             putInt(hash)
         }.array()
