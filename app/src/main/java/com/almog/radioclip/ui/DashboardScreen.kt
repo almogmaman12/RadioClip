@@ -37,6 +37,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -74,6 +75,10 @@ fun DashboardScreen(
     history: List<Payload>,
     clipboardSyncEnabled: Boolean,
     onClipboardSyncChange: (Boolean) -> Unit,
+    pairingConfigured: Boolean,
+    pairingError: String?,
+    onPairingPhrase: (String) -> Unit,
+    onForgetPairing: () -> Unit,
     onConnectPeer: (transportType: TransportType, peerId: String) -> Unit,
     onSendText: (String) -> Unit,
     onSendFile: (name: String, mimeType: String, sizeBytes: Long, uriString: String) -> Unit,
@@ -81,6 +86,7 @@ fun DashboardScreen(
 ) {
     val context = LocalContext.current
     var textInput by remember { mutableStateOf("") }
+    var pairingPhrase by remember { mutableStateOf("") }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -209,8 +215,64 @@ fun DashboardScreen(
                 )
             }
 
-            // Android restricts background clipboard reads, and peer traffic is not
-            // authenticated yet. Require clear opt-in for automatic clipboard sync.
+            // Each phone must have the same locally entered passphrase.
+            // Without it, no payloads are accepted or transmitted.
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Secure connection", style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold)
+                        Text(
+                            if (pairingConfigured) "Pairing phrase is configured"
+                            else "Enter the same private phrase on both devices before transferring.",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        OutlinedTextField(
+                            value = pairingPhrase,
+                            onValueChange = { pairingPhrase = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            label = { Text(if (pairingConfigured) "Change pairing phrase" else "Pairing phrase") },
+                            placeholder = { Text("16+ characters, letters and numbers") }
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                enabled = pairingPhrase.length >= 16,
+                                onClick = {
+                                    onPairingPhrase(pairingPhrase)
+                                    pairingPhrase = ""
+                                }
+                            ) {
+                                Text(if (pairingConfigured) "Update" else "Save phrase")
+                            }
+                            if (pairingConfigured) {
+                                OutlinedButton(onClick = onForgetPairing) { Text("Forget") }
+                            }
+                        }
+                        pairingError?.let { error ->
+                            Text(error, color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text(
+                            "AES-256-GCM protects transferred text and file contents. " +
+                                "The phrase is never sent over the radio. Use a long unique phrase; " +
+                                "any device with the phrase can join this sharing group.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+
+            // Android restricts background clipboard reads. Require opt-in.
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -229,11 +291,16 @@ fun DashboardScreen(
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
-                            Switch(checked = clipboardSyncEnabled, onCheckedChange = onClipboardSyncChange)
+                            Switch(
+                                checked = clipboardSyncEnabled,
+                                onCheckedChange = onClipboardSyncChange,
+                                enabled = pairingConfigured
+                            )
                         }
                         Text(
-                            "Experimental. Nearby transfers are not encrypted or authenticated yet. " +
-                                "Enable only around devices you trust. Android 10+ also limits background clipboard access.",
+                            "Experimental. Transfers require a matching pairing phrase. " +
+                                "Android 10+ restricts background clipboard reads. " +
+                                "Only enable automatic sharing around devices you trust.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -277,7 +344,8 @@ fun DashboardScreen(
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 FilledTonalButton(
-                                    onClick = { filePickerLauncher.launch("*/*") }
+                                    onClick = { filePickerLauncher.launch("*/*") },
+                                    enabled = pairingConfigured
                                 ) {
                                     Text("Pick File")
                                 }
@@ -288,7 +356,7 @@ fun DashboardScreen(
                                             textInput = ""
                                         }
                                     },
-                                    enabled = textInput.isNotBlank()
+                                    enabled = pairingConfigured && textInput.isNotBlank()
                                 ) {
                                     Text("Send")
                                 }
