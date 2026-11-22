@@ -29,9 +29,11 @@ All communications occur over standard local RF interfaces (`Bluetooth LE` and `
   - **Wi-Fi Direct (P2P) Transport**: Peer-to-peer TCP for encrypted text and files up to 512 MB with per-chunk authentication and receiver confirmation.
 - **📱 Background Sync Service**:
   - Runs a foreground persistent Android Service (`connectedDevice`) maintaining radio liveness and listening for incoming payloads.
-- **👥 Active Peer Discovery & Manual Connect**:
-  - BLE discovery and advertising are available; connection requires a manual selection. The dashboard displays peers and connection states.
-  - Interactive "Connect" buttons for targeted P2P link establishment.
+- **👥 App-Specific Peer Discovery & Manual Connect**:
+  - BLE discovery is filtered by RadioClip's Bluetooth service UUID.
+  - Wi-Fi Direct advertises and discovers the `RadioClip._radioclip._tcp` DNS-SD service; unrelated devices are not listed.
+  - Install this version on both devices. Keep Wi-Fi and Location enabled, open RadioClip on each phone, enter matching pairing phrases, then select a discovered peer.
+  - Service discovery is not proof of trust. Transfers require the encrypted authenticated handshake.
 - **📥 In-App File Opening**:
   - Received files are stored in app-private files, validated for declared size, and can be opened through `FileProvider` intents.
 - **🎨 Modern Jetpack Compose UI**:
