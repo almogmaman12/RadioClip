@@ -75,7 +75,9 @@ fun DashboardScreen(
     connectedWifiPeers: List<PeerDevice>,
     history: List<Payload>,
     clipboardSyncEnabled: Boolean,
+    clipboardSyncStatus: String,
     onClipboardSyncChange: (Boolean) -> Unit,
+    onSyncClipboardNow: () -> Unit,
     pairingConfigured: Boolean,
     pairingError: String?,
     onPairingPhrase: (String) -> Unit,
@@ -295,9 +297,9 @@ fun DashboardScreen(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text("Automatic clipboard sync", fontWeight = FontWeight.SemiBold)
+                                Text("Clipboard sync while app is active", fontWeight = FontWeight.SemiBold)
                                 Text(
-                                    if (clipboardSyncEnabled) "Enabled" else "Off by default",
+                                    if (clipboardSyncEnabled) "On" else "Off",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -308,9 +310,25 @@ fun DashboardScreen(
                             )
                         }
                         Text(
-                            "Experimental. Transfers require a matching pairing phrase. " +
-                                "Android 10+ restricts background clipboard reads. " +
-                                "Only enable automatic sharing around devices you trust.",
+                            clipboardSyncStatus,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (clipboardSyncStatus.startsWith("Not delivered") ||
+                                clipboardSyncStatus.startsWith("Unable") ||
+                                clipboardSyncStatus.startsWith("Clipboard access denied")
+                            ) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        OutlinedButton(
+                            enabled = clipboardSyncEnabled && pairingConfigured,
+                            onClick = onSyncClipboardNow
+                        ) {
+                            Text("Sync clipboard now")
+                        }
+                        Text(
+                            "Android 10+ blocks clipboard reads from other apps while " +
+                                "RadioClip is in the background. Copy something, then return " +
+                                "here to sync it, or use Share → RadioClip in the other app. " +
+                                "Only enable this with trusted devices.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
