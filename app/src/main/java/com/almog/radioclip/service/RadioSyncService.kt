@@ -62,6 +62,8 @@ class RadioSyncService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
     private val binder = LocalBinder()
+    private var transportsStarted = false
+    private val historyLimit = 200
 
     lateinit var bleEngine: BleEngine
         private set
@@ -101,8 +103,9 @@ class RadioSyncService : Service() {
         // Observe incoming payloads from peers
         serviceScope.launch {
             router.incomingPayloads.collect { payload ->
-                Log.d(TAG, "Incoming payload collected in service: $payload")
-                _history.value = listOf(payload) + _history.value
+                // Don't log clipboard content or filenames in plaintext.
+                Log.d(TAG, "Incoming payload received over ${payload.transportType}")
+                _history.value = (listOf(payload) + _history.value).take(historyLimit)
 
                 // If incoming payload is text, update local clipboard without re-broadcasting
                 if (payload is Payload.Text) {
@@ -161,9 +164,20 @@ class RadioSyncService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startAsForegroundService()
 
-        serviceScope.launch {
-            bleEngine.start()
-            wifiEngine.start()
+        if (!transportsStarted) {
+            transportsStarted = true
+            serviceScope.launch {
+                try {
+                    bleEngine.start()
+                } catch (e: Exception) {
+                    Log.e(TAG, "BLE startup failed", e)
+                }
+                try {
+                    wifiEngine.start()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Wi-Fi Direct startup failed", e)
+                }
+            }
         }
 
         return START_STICKY
@@ -175,7 +189,7 @@ class RadioSyncService : Service() {
             val text = clip.getItemAt(0)?.text?.toString()
             if (!text.isNullOrBlank() && text != lastSyncedClipboardText) {
                 lastSyncedClipboardText = text
-                Log.d(TAG, "Auto-detected clipboard change: ${text.take(30)}")
+                Log.d(TAG, "Local clipboard changed")
                 sendPayload(Payload.Text(content = text, isOutgoing = true))
             }
         }
@@ -274,11 +288,14 @@ class RadioSyncService : Service() {
             val result = router.route(payload)
             val actualTransport = result.getOrNull() ?: payload.transportType
             val record = when (payload) {
-                is Payload.Text -> payload.copy(transportType = actualTransport, isOutgoing = true)
-                is Payload.File -> payload.copy(transportType = actualTransport, isOutgoing = true)
+                is Payload.Text -> payload.copy(
+                    transportType = actualTransport, isOutgoing = true, isFailed = result.isFailure
+                )
+                is Payload.File -> payload.copy(
+                    transportType = actualTransport, isOutgoing = true, isFailed = result.isFailure
+                )
             }
-            // Always add to history for user visibility, whether routed immediately or queued
-            _history.value = listOf(record) + _history.value
+            _history.value = (listOf(record) + _history.value).take(historyLimit)
 
             if (result.isFailure) {
                 Log.w(TAG, "Failed to route payload: ${result.exceptionOrNull()?.message}")
@@ -296,10 +313,14 @@ class RadioSyncService : Service() {
             activeInstance = null
         }
         clipboardManager?.removePrimaryClipChangedListener(clipboardListener)
+        // Let transport cleanup complete before cancelling the service scope.
         serviceScope.launch {
-            bleEngine.stop()
-            wifiEngine.stop()
+            try {
+                bleEngine.stop()
+                wifiEngine.stop()
+            } finally {
+                serviceJob.cancel()
+            }
         }
-        serviceJob.cancel()
     }
 }
