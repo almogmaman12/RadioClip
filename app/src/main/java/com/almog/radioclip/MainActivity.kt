@@ -31,12 +31,17 @@ class MainActivity : ComponentActivity() {
 
     private var syncService: RadioSyncService? by mutableStateOf(RadioSyncService.activeInstance)
     private var isBound by mutableStateOf(false)
+    private var pendingFilePayload: Payload.File? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as RadioSyncService.LocalBinder
             syncService = binder.getService()
             isBound = true
+            pendingFilePayload?.let { file ->
+                syncService?.sendPayload(file)
+                pendingFilePayload = null
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -79,26 +84,36 @@ class MainActivity : ComponentActivity() {
 
                 // File picker launcher that can be triggered from UI or from notification action
                 val filePickerLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.GetContent()
+                    contract = ActivityResultContracts.OpenDocument()
                 ) { uri: android.net.Uri? ->
                     triggerFilePicker = false
                     uri?.let {
+                        try {
+                            contentResolver.takePersistableUriPermission(
+                                it, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            )
+                        } catch (_: SecurityException) {
+                            // Some document providers do not grant persistence.
+                        }
                         val (name, size) = queryFileMeta(this, it)
                         val mime = contentResolver.getType(it) ?: "application/octet-stream"
-                        syncService?.sendPayload(
-                            Payload.File(
-                                fileName = name,
-                                mimeType = mime,
-                                sizeBytes = size,
-                                uriString = it.toString()
-                            )
+                        val chosenFile = Payload.File(
+                            fileName = name,
+                            mimeType = mime,
+                            sizeBytes = size,
+                            uriString = it.toString()
                         )
+                        if (syncService != null) {
+                            syncService?.sendPayload(chosenFile)
+                        } else {
+                            pendingFilePayload = chosenFile
+                        }
                     }
                 }
 
                 androidx.compose.runtime.LaunchedEffect(triggerFilePicker) {
                     if (triggerFilePicker) {
-                        filePickerLauncher.launch("*/*")
+                        filePickerLauncher.launch(arrayOf("*/*"))
                     }
                 }
 
