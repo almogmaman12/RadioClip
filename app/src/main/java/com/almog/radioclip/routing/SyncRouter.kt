@@ -62,6 +62,21 @@ class SyncRouter(
      * - Files or larger text payloads route over Wi-Fi Direct / Local Sockets.
      */
     suspend fun route(payload: Payload, targetPeerId: String? = null): Result<TransportType> {
+        // A transport peer ID is not interchangeable between BLE and Wi-Fi Direct.
+        // Never silently redirect a targeted message to a different nearby device.
+        if (targetPeerId != null) {
+            val isBlePeer = bleEngine.connectedPeers.value.any { it.id == targetPeerId }
+            val isWifiPeer = wifiEngine.connectedPeers.value.any { it.id == targetPeerId }
+            return when {
+                payload is Payload.Text && payload.byteSize <= BLE_MAX_PAYLOAD_BYTES && isBlePeer ->
+                    bleEngine.send(payload, targetPeerId).map { TransportType.BLE_GATT }
+                isWifiPeer ->
+                    wifiEngine.send(payload, targetPeerId).map { TransportType.WIFI_DIRECT_SOCKET }
+                else -> Result.failure(
+                    IllegalStateException("No compatible connection to the selected peer")
+                )
+            }
+        }
         return when (payload) {
             is Payload.Text -> {
                 if (payload.byteSize <= BLE_MAX_PAYLOAD_BYTES && isBleReady()) {
