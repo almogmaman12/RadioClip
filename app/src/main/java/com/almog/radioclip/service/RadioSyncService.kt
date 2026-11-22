@@ -77,6 +77,17 @@ class RadioSyncService : Service() {
     private val _history = MutableStateFlow<List<Payload>>(emptyList())
     val history: StateFlow<List<Payload>> = _history.asStateFlow()
 
+    // Clipboard access is sensitive and often restricted for background apps.
+    // Manual text transfer remains available without enabling this setting.
+    private val _clipboardSyncEnabled = MutableStateFlow(false)
+    val clipboardSyncEnabled: StateFlow<Boolean> = _clipboardSyncEnabled.asStateFlow()
+
+    fun setClipboardSyncEnabled(enabled: Boolean) {
+        _clipboardSyncEnabled.value = enabled
+        getSharedPreferences("radioclip", MODE_PRIVATE).edit()
+            .putBoolean("clipboard_sync_enabled", enabled).apply()
+    }
+
     private var clipboardManager: ClipboardManager? = null
     private var lastSyncedClipboardText: String? = null
 
@@ -91,6 +102,8 @@ class RadioSyncService : Service() {
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
+        _clipboardSyncEnabled.value = getSharedPreferences("radioclip", MODE_PRIVATE)
+            .getBoolean("clipboard_sync_enabled", false)
         createNotificationChannel()
 
         bleEngine = BleEngine(applicationContext, serviceScope)
@@ -108,7 +121,7 @@ class RadioSyncService : Service() {
                 _history.value = (listOf(payload) + _history.value).take(historyLimit)
 
                 // If incoming payload is text, update local clipboard without re-broadcasting
-                if (payload is Payload.Text) {
+                if (payload is Payload.Text && _clipboardSyncEnabled.value) {
                     applyToLocalClipboard(payload.content)
                 } else if (payload is Payload.File) {
                     // Trigger notification alert when receiving a file
@@ -184,6 +197,7 @@ class RadioSyncService : Service() {
     }
 
     private fun handleClipboardChanged() {
+        if (!_clipboardSyncEnabled.value) return
         val clip = clipboardManager?.primaryClip ?: return
         if (clip.itemCount > 0) {
             val text = clip.getItemAt(0)?.text?.toString()
