@@ -117,6 +117,14 @@ class SecureLink(private val context: Context) {
         return cipher.doFinal(envelope, IV_LENGTH, envelope.size - IV_LENGTH)
     }
 
+    /** 96-bit MAC used for BLE delivery acknowledgements within a 23-byte MTU. */
+    fun authenticationTag(message: ByteArray): ByteArray {
+        val key = peerKey ?: error("Enter a pairing phrase before sending")
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(key.encoded, "HmacSHA256"))
+        return mac.doFinal(message).copyOf(12)
+    }
+
     private fun localStorageKey(): java.security.Key {
         val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
         keyStore.getKey(KEY_ALIAS, null)?.let { return it }
