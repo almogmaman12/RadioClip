@@ -15,6 +15,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -69,6 +72,9 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
+            // The interface is English-only for now; the system's Hebrew RTL
+            // setting must not reverse its buttons and text layout.
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
             RadioClipTheme {
                 val permissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -189,6 +195,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 )
+            }
             }
         }
     }
