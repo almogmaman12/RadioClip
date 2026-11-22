@@ -495,38 +495,23 @@ class WifiEngine(
         val peers = mutableListOf<PeerDevice>()
         val connectedMac = pendingConnectMac
 
-        if (!isGroupOwner) {
-            val device = connectedMac?.let { discoveredDevices[it] }
-            val peerName = device?.deviceName?.takeIf { it.isNotBlank() }
-                ?: "Wi-Fi Direct GO ($goAddress)"
-            val peerId = connectedMac ?: goAddress ?: "p2p_group"
-            peers.add(PeerDevice(
-                id = peerId,
-                name = peerName,
-                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                isConnected = true
-            ))
-            val existing = _discoveredPeers.value.toMutableList()
-            val idx = existing.indexOfFirst { it.id == peerId }
-            if (idx < 0) {
-                existing.add(PeerDevice(id = peerId, name = peerName,
-                    transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
-            } else {
-                existing[idx] = existing[idx].copy(isConnected = true)
-            }
-            _discoveredPeers.value = existing
-            sendHelloToGroupOwner(goAddress)
-        } else if (isGroupOwner) {
-            peers.add(PeerDevice(
-                id = goAddress ?: "p2p_group",
-                name = "Group Owner (GO: $goAddress)",
-                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                isConnected = true
-            ))
+        if (isGroupOwner) {
+            // A group can form before another RadioClip peer has authenticated.
+            // Only peers that complete the encrypted hello enter the list.
             connectedClientIps.forEach { clientIp ->
-                peers.add(PeerDevice(id = clientIp, name = "Client ($clientIp)",
-                    transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
+                peers.add(
+                    PeerDevice(
+                        id = clientIp,
+                        name = "RadioClip peer ($clientIp)",
+                        transportType = TransportType.WIFI_DIRECT_SOCKET,
+                        isConnected = true
+                    )
+                )
             }
+        } else {
+            // The group owner's Wi-Fi identity alone does not prove it has RadioClip.
+            // sendHelloToGroupOwner() adds it only after an authenticated response.
+            sendHelloToGroupOwner(goAddress)
         }
 
         _connectedPeers.value = peers
@@ -539,6 +524,10 @@ class WifiEngine(
      * which the GO needs to send data back to this client device.
      */
     fun onPairingChanged() {
+        // Invalidate all previous authentication when the group phrase changes.
+        connectedClientIps.clear()
+        _connectedPeers.value = emptyList()
+        refreshVerifiedPeerList()
         if (!isGroupOwner && _state.value == TransportState.CONNECTED) {
             sendHelloToGroupOwner(groupOwnerAddress)
         }
@@ -550,6 +539,20 @@ class WifiEngine(
             delay(1500)
             try {
                 sendOnce(goAddress, null)
+                val peerId = pendingConnectMac
+                if (peerId != null && radioClipSeenAt.containsKey(peerId)) {
+                    val device = discoveredDevices[peerId]
+                    _connectedPeers.value = listOf(
+                        PeerDevice(
+                            id = peerId,
+                            name = device?.deviceName?.takeIf { it.isNotBlank() }
+                                ?: "RadioClip peer",
+                            transportType = TransportType.WIFI_DIRECT_SOCKET,
+                            isConnected = true
+                        )
+                    )
+                    refreshVerifiedPeerList()
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Authenticated Wi-Fi Direct peer registration failed", e)
             }
@@ -599,17 +602,21 @@ class WifiEngine(
     }
 
     private fun updateConnectedPeersList() {
-        val goAddress = groupOwnerAddress ?: "p2p_group"
-        val goId = if (isGroupOwner) goAddress else (pendingConnectMac ?: goAddress)
-        val ownerLabel = if (isGroupOwner) "Group Owner (GO: $goAddress)" else "Connected (GO: $goAddress)"
-        val list = mutableListOf(
-            PeerDevice(
-                id = goId,
-                name = ownerLabel,
-                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                isConnected = true
-            )
-        )
+        // Group Owner is this phone, not another discovered RadioClip peer.
+        val list = mutableListOf<PeerDevice>()
+        if (!isGroupOwner) {
+            val address = pendingConnectMac
+            if (address != null && radioClipSeenAt.containsKey(address)) {
+                list.add(
+                    PeerDevice(
+                        id = address,
+                        name = discoveredDevices[address]?.deviceName ?: "RadioClip peer",
+                        transportType = TransportType.WIFI_DIRECT_SOCKET,
+                        isConnected = true
+                    )
+                )
+            }
+        }
         connectedClientIps.forEach { clientIp ->
             list.add(PeerDevice(
                 id = clientIp,
@@ -620,17 +627,9 @@ class WifiEngine(
         }
         _connectedPeers.value = list
 
-        // For GO: also add clients into discoveredPeers so they show in the UI list
-        if (isGroupOwner && connectedClientIps.isNotEmpty()) {
-            val existing = _discoveredPeers.value.toMutableList()
-            connectedClientIps.forEach { clientIp ->
-                if (existing.none { it.id == clientIp }) {
-                    existing.add(PeerDevice(id = clientIp, name = "Client ($clientIp)",
-                        transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
-                }
-            }
-            _discoveredPeers.value = existing
-        }
+        // For GO: these IPs have sent a valid encrypted hello.
+        // Do not place group-owner placeholders in the nearby-device list.
+        // Connected RadioClip peers are merged into the dashboard separately.
     }
 
     private fun authenticationData(
