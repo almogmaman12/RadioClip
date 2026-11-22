@@ -37,13 +37,14 @@ class MainActivity : ComponentActivity() {
     private var pendingFilePayload: Payload.File? = null
     private var pendingSharedText: String? = null
     private var windowCurrentlyFocused = false
+    private var activityResumed = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as RadioSyncService.LocalBinder
             syncService = binder.getService()
             isBound = true
-            syncService?.setWindowFocused(windowCurrentlyFocused)
+            syncService?.setWindowFocused(activityResumed && windowCurrentlyFocused)
             pendingSharedText?.let { shared ->
                 syncService?.sendPayload(Payload.Text(content = shared))
                 pendingSharedText = null
@@ -101,16 +102,18 @@ class MainActivity : ComponentActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         windowCurrentlyFocused = hasFocus
-        syncService?.setWindowFocused(hasFocus)
+        syncService?.setWindowFocused(activityResumed && hasFocus)
     }
 
     override fun onPause() {
+        activityResumed = false
         syncService?.setWindowFocused(false)
         super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
         if (windowCurrentlyFocused) syncService?.setWindowFocused(true)
     }
 
