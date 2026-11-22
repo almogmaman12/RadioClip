@@ -14,6 +14,7 @@ import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.util.Log
+import com.almog.radioclip.security.SecureLink
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.PeerDevice
 import com.almog.radioclip.model.TransportState
@@ -33,6 +34,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
+import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.InputStream
@@ -47,7 +49,8 @@ import kotlin.coroutines.suspendCoroutine
 @SuppressLint("MissingPermission")
 class WifiEngine(
     private val context: Context,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job())
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job()),
+    private val secureLink: SecureLink
 ) : DeviceTransport {
 
     companion object {
@@ -56,8 +59,13 @@ class WifiEngine(
         private const val SOCKET_TIMEOUT_MS = 10000
 
         // Stream wire protocol tags
+        private const val TYPE_HELLO: Byte = 0
         private const val TYPE_TEXT: Byte = 1
         private const val TYPE_FILE: Byte = 2
+        private const val ACK_SUCCESS = 1
+        private const val FILE_CHUNK = 64 * 1024
+        private const val MAX_TEXT_BYTES = 1024 * 1024
+        private const val CRYPTO_OVERHEAD = 28
     }
 
     override val transportType: TransportType = TransportType.WIFI_DIRECT_SOCKET
@@ -92,6 +100,7 @@ class WifiEngine(
 
     private val connectedClientIps = ConcurrentHashMap.newKeySet<String>()
     private val discoveredDevices = ConcurrentHashMap<String, WifiP2pDevice>()
+    private val deliveredIds = ConcurrentHashMap<String, Long>()
 
     // MAC address of the peer we initiated connect() to, used for UI ID matching
     @Volatile
@@ -423,23 +432,13 @@ class WifiEngine(
      * which the GO needs to send data back to this client device.
      */
     private fun sendHelloToGroupOwner(goAddress: String?) {
-        if (goAddress.isNullOrBlank()) return
+        if (goAddress.isNullOrBlank() || !secureLink.configured.value) return
         scope.launch(Dispatchers.IO) {
+            delay(1500)
             try {
-                delay(1500) // Brief wait for DHCP/routing to be fully ready
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress(goAddress, PORT), SOCKET_TIMEOUT_MS)
-                    val output = DataOutputStream(socket.getOutputStream())
-                    // Send a TYPE_TEXT hello so GO's protocol parser can handle it cleanly
-                    output.writeByte(TYPE_TEXT.toInt())
-                    output.writeUTF("__radioclip_hello__")
-                    output.writeLong(System.currentTimeMillis())
-                    output.writeUTF("__peer_hello__")
-                    output.flush()
-                }
-                Log.d(TAG, "Peer hello sent to Group Owner: $goAddress")
+                sendOnce(goAddress, null)
             } catch (e: Exception) {
-                Log.w(TAG, "Peer hello to GO failed (non-critical): ${e.message}")
+                Log.w(TAG, "Authenticated Wi-Fi Direct peer registration failed", e)
             }
         }
     }
@@ -473,11 +472,6 @@ class WifiEngine(
                     if (_state.value != TransportState.CONNECTED || groupOwnerAddress == null) {
                         socket.close()
                         continue
-                    }
-                    val clientIp = socket.inetAddress?.hostAddress
-                    if (clientIp != null && isGroupOwner) {
-                        connectedClientIps.add(clientIp)
-                        updateConnectedPeersList()
                     }
                     launch(Dispatchers.IO) {
                         handleIncomingConnection(socket)
@@ -526,144 +520,279 @@ class WifiEngine(
         }
     }
 
+    private fun authenticationData(
+        type: Byte,
+        id: String,
+        timestamp: Long,
+        fileName: String = "",
+        mimeType: String = "",
+        fileSize: Long = 0,
+        chunkIndex: Int = 0
+    ): ByteArray = ByteArrayOutputStream().use { bytes ->
+        DataOutputStream(bytes).use { out ->
+            out.writeByte(2) // RadioClip protocol version
+            out.writeByte(type.toInt())
+            out.writeUTF(id)
+            out.writeLong(timestamp)
+            out.writeUTF(fileName)
+            out.writeUTF(mimeType)
+            out.writeLong(fileSize)
+            out.writeInt(chunkIndex)
+        }
+        bytes.toByteArray()
+    }
+
+    private fun registerAuthenticatedClient(address: String?) {
+        if (isGroupOwner && !address.isNullOrBlank() && connectedClientIps.add(address)) {
+            updateConnectedPeersList()
+        }
+    }
+
+    private fun rememberDelivery(id: String): Boolean {
+        val now = System.currentTimeMillis()
+        deliveredIds.entries.removeIf { now - it.value > 10 * 60_000L }
+        return deliveredIds.putIfAbsent(id, now) == null
+    }
+
     private suspend fun handleIncomingConnection(socket: Socket) = withContext(Dispatchers.IO) {
         socket.use { s ->
             try {
                 val input = DataInputStream(s.getInputStream())
+                val output = DataOutputStream(s.getOutputStream())
                 val wireType = input.readByte()
                 val payloadId = input.readUTF()
                 val timestamp = input.readLong()
-
                 val clientIp = s.inetAddress?.hostAddress
-                val resolvedSenderName = when {
-                    !isGroupOwner -> {
-                        val mac = pendingConnectMac
-                        val dev = if (mac != null) discoveredDevices[mac] else null
-                        dev?.deviceName?.takeIf { it.isNotBlank() } ?: "Group Owner ($clientIp)"
-                    }
-                    else -> {
-                        // We are Group Owner, find matching client device by looking at discovered devices
-                        val matchingDevice = discoveredDevices.values.firstOrNull { it.status == WifiP2pDevice.CONNECTED }
-                        matchingDevice?.deviceName?.takeIf { it.isNotBlank() } ?: "Client ($clientIp)"
-                    }
+                val resolvedSenderName = if (!isGroupOwner) {
+                    val device = pendingConnectMac?.let { discoveredDevices[it] }
+                    device?.deviceName?.takeIf { it.isNotBlank() } ?: "Group Owner"
+                } else {
+                    "Paired Wi-Fi Direct peer"
                 }
 
                 when (wireType) {
-                    TYPE_TEXT -> {
-                        val text = input.readUTF()
-                        if (text == "__peer_hello__") {
-                            // Client sent a hello to register its IP on the GO's ServerSocket
-                            Log.d(TAG, "Received peer hello from $clientIp — IP registered")
-                            return@use // IP already captured via ServerSocket.accept()
-                        }
-                        _incomingPayloads.emit(
-                            Payload.Text(
-                                id = payloadId,
-                                timestamp = timestamp,
-                                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                                senderDeviceName = resolvedSenderName,
-                                isOutgoing = false,
-                                content = text
-                            )
+                    TYPE_HELLO -> {
+                        val length = input.readInt()
+                        require(length in CRYPTO_OVERHEAD..256) { "Invalid pairing hello" }
+                        val packet = ByteArray(length)
+                        input.readFully(packet)
+                        val message = secureLink.open(
+                            packet, authenticationData(wireType, payloadId, timestamp)
                         )
-                        Log.d(TAG, "Received Text via Wi-Fi socket from $resolvedSenderName: ${text.take(30)}")
+                        require(message.contentEquals("RadioClip hello v2".toByteArray(Charsets.UTF_8))) {
+                            "Unrecognized pairing hello"
+                        }
+                        registerAuthenticatedClient(clientIp)
+                    }
+
+                    TYPE_TEXT -> {
+                        val length = input.readInt()
+                        require(length in CRYPTO_OVERHEAD..(MAX_TEXT_BYTES + CRYPTO_OVERHEAD)) {
+                            "Invalid encrypted message size"
+                        }
+                        val packet = ByteArray(length)
+                        input.readFully(packet)
+                        val plain = secureLink.open(
+                            packet, authenticationData(wireType, payloadId, timestamp)
+                        )
+                        require(plain.size <= MAX_TEXT_BYTES) { "Text is too large" }
+                        registerAuthenticatedClient(clientIp)
+                        if (rememberDelivery(payloadId)) {
+                            _incomingPayloads.emit(
+                                Payload.Text(
+                                    id = payloadId,
+                                    timestamp = timestamp,
+                                    transportType = TransportType.WIFI_DIRECT_SOCKET,
+                                    senderDeviceName = resolvedSenderName,
+                                    isOutgoing = false,
+                                    content = String(plain, Charsets.UTF_8)
+                                )
+                            )
+                        }
                     }
 
                     TYPE_FILE -> {
                         val fileName = input.readUTF()
                         val mimeType = input.readUTF()
                         val fileSize = input.readLong()
-
                         FileTransferSafety.checkSize(fileSize)
-
-                        // Strip any directory components from untrusted filenames. Use a
-                        // generated prefix to prevent accidental overwrites or traversal.
                         val safeName = FileTransferSafety.safeName(fileName)
-                        val receivedDir = File(context.filesDir, "received_files").apply { mkdirs() }
-                        val targetFile = File(receivedDir, "${UUID.randomUUID()}-$safeName")
-
+                        val directory = File(context.filesDir, "received_files").apply { mkdirs() }
+                        val target = File(directory, "${UUID.randomUUID()}-$safeName")
                         try {
-                            targetFile.outputStream().use { out ->
-                                FileTransferSafety.copyExactly(input, out, fileSize)
+                            target.outputStream().use { stream ->
+                                var remaining = fileSize
+                                var chunkIndex = 0
+                                do {
+                                    val expectedPlain = minOf(remaining, FILE_CHUNK.toLong()).toInt()
+                                    val expectedSealed = expectedPlain + CRYPTO_OVERHEAD
+                                    val sealedSize = input.readInt()
+                                    require(sealedSize == expectedSealed) { "Invalid encrypted file chunk" }
+                                    val sealed = ByteArray(sealedSize)
+                                    input.readFully(sealed)
+                                    val plain = secureLink.open(
+                                        sealed,
+                                        authenticationData(
+                                            wireType, payloadId, timestamp,
+                                            fileName, mimeType, fileSize, chunkIndex
+                                        )
+                                    )
+                                    require(plain.size == expectedPlain) { "File chunk size mismatch" }
+                                    stream.write(plain)
+                                    remaining -= plain.size
+                                    chunkIndex++
+                                } while (remaining > 0)
                             }
                         } catch (e: Exception) {
-                            targetFile.delete()
+                            target.delete()
                             throw e
                         }
-
-                        _incomingPayloads.emit(
-                            Payload.File(
-                                id = payloadId,
-                                timestamp = timestamp,
-                                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                                senderDeviceName = resolvedSenderName,
-                                isOutgoing = false,
-                                fileName = safeName,
-                                mimeType = mimeType,
-                                sizeBytes = fileSize,
-                                localPath = targetFile.absolutePath
+                        registerAuthenticatedClient(clientIp)
+                        if (rememberDelivery(payloadId)) {
+                            _incomingPayloads.emit(
+                                Payload.File(
+                                    id = payloadId,
+                                    timestamp = timestamp,
+                                    transportType = TransportType.WIFI_DIRECT_SOCKET,
+                                    senderDeviceName = resolvedSenderName,
+                                    isOutgoing = false,
+                                    fileName = safeName,
+                                    mimeType = mimeType,
+                                    sizeBytes = fileSize,
+                                    localPath = target.absolutePath
+                                )
                             )
-                        )
-                        Log.d(TAG, "Received File via Wi-Fi socket from $resolvedSenderName: $fileName ($fileSize bytes)")
+                        } else {
+                            target.delete()
+                        }
                     }
+
+                    else -> error("Unknown RadioClip wire type")
                 }
+                output.writeByte(ACK_SUCCESS)
+                output.flush()
             } catch (e: Exception) {
-                Log.e(TAG, "Error handling incoming socket connection", e)
+                Log.w(TAG, "Rejected or interrupted Wi-Fi Direct transfer", e)
             }
         }
     }
 
-    override suspend fun send(payload: Payload, targetPeerId: String?): Result<Unit> = withContext(Dispatchers.IO) {
-        runCatching {
-            val destinationIp = when {
-                targetPeerId != null && targetPeerId.contains(".") -> targetPeerId
-                !isGroupOwner && !groupOwnerAddress.isNullOrBlank() -> groupOwnerAddress
-                isGroupOwner && connectedClientIps.isNotEmpty() -> connectedClientIps.first()
-                else -> groupOwnerAddress ?: error("Destination IP unknown. No P2P group formed or client IP recorded.")
+    private fun sendOnce(destinationIp: String, payload: Payload?) {
+        Socket().use { socket ->
+            socket.connect(InetSocketAddress(destinationIp, PORT), SOCKET_TIMEOUT_MS)
+            socket.soTimeout = SOCKET_TIMEOUT_MS
+            val output = DataOutputStream(socket.getOutputStream())
+            val payloadId = payload?.id ?: "__peer_hello__"
+            val timestamp = payload?.timestamp ?: 0L
+            val wireType: Byte = when (payload) {
+                is Payload.Text -> TYPE_TEXT
+                is Payload.File -> TYPE_FILE
+                null -> TYPE_HELLO
             }
-
-            Log.d(TAG, "Connecting TCP socket to $destinationIp:$PORT to send ${payload.javaClass.simpleName}")
-
-            Socket().use { socket ->
-                socket.connect(InetSocketAddress(destinationIp, PORT), SOCKET_TIMEOUT_MS)
-                socket.soTimeout = SOCKET_TIMEOUT_MS
-                val output = DataOutputStream(socket.getOutputStream())
-
-                when (payload) {
-                    is Payload.Text -> {
-                        output.writeByte(TYPE_TEXT.toInt())
-                        output.writeUTF(payload.id)
-                        output.writeLong(payload.timestamp)
-                        output.writeUTF(payload.content)
-                        output.flush()
-                    }
-
-                    is Payload.File -> {
-                        FileTransferSafety.checkSize(payload.sizeBytes)
-                        output.writeByte(TYPE_FILE.toInt())
-                        output.writeUTF(payload.id)
-                        output.writeLong(payload.timestamp)
-                        output.writeUTF(payload.fileName)
-                        output.writeUTF(payload.mimeType)
-                        output.writeLong(payload.sizeBytes)
-
-                        val inputStream: InputStream? = if (payload.uriString != null) {
-                            context.contentResolver.openInputStream(Uri.parse(payload.uriString))
-                        } else if (payload.localPath != null) {
-                            File(payload.localPath).inputStream()
-                        } else null
-
-                        inputStream?.use { stream ->
-                            FileTransferSafety.copyExactly(stream, output, payload.sizeBytes)
-                            require(stream.read() == -1) { "File is larger than the size reported by Android" }
-                        } ?: error("Unable to open stream for file payload: ${payload.fileName}")
-
-                        output.flush()
+            output.writeByte(wireType.toInt())
+            output.writeUTF(payloadId)
+            output.writeLong(timestamp)
+            when (payload) {
+                null -> {
+                    val message = "RadioClip hello v2".toByteArray(Charsets.UTF_8)
+                    val sealed = secureLink.seal(
+                        message, authenticationData(wireType, payloadId, timestamp)
+                    )
+                    output.writeInt(sealed.size)
+                    output.write(sealed)
+                }
+                is Payload.Text -> {
+                    val plaintext = payload.content.toByteArray(Charsets.UTF_8)
+                    require(plaintext.size <= MAX_TEXT_BYTES) { "Text exceeds 1 MB" }
+                    val sealed = secureLink.seal(
+                        plaintext, authenticationData(wireType, payloadId, timestamp)
+                    )
+                    output.writeInt(sealed.size)
+                    output.write(sealed)
+                }
+                is Payload.File -> {
+                    FileTransferSafety.checkSize(payload.sizeBytes)
+                    output.writeUTF(payload.fileName)
+                    output.writeUTF(payload.mimeType)
+                    output.writeLong(payload.sizeBytes)
+                    val inputStream: InputStream? = if (payload.uriString != null) {
+                        context.contentResolver.openInputStream(Uri.parse(payload.uriString))
+                    } else if (payload.localPath != null) {
+                        File(payload.localPath).inputStream()
+                    } else null
+                    (inputStream ?: error("Unable to open selected file")).use { stream ->
+                        var remaining = payload.sizeBytes
+                        var chunkIndex = 0
+                        val buffer = ByteArray(FILE_CHUNK)
+                        do {
+                            val expected = minOf(remaining, FILE_CHUNK.toLong()).toInt()
+                            var readTotal = 0
+                            while (readTotal < expected) {
+                                val count = stream.read(buffer, readTotal, expected - readTotal)
+                                if (count < 0) throw java.io.EOFException("File changed during transfer")
+                                if (count == 0) continue
+                                readTotal += count
+                            }
+                            val sealed = secureLink.seal(
+                                buffer.copyOf(expected),
+                                authenticationData(
+                                    wireType, payloadId, timestamp,
+                                    payload.fileName, payload.mimeType, payload.sizeBytes, chunkIndex
+                                )
+                            )
+                            output.writeInt(sealed.size)
+                            output.write(sealed)
+                            remaining -= expected
+                            chunkIndex++
+                        } while (remaining > 0)
+                        require(stream.read() == -1) { "File size changed during transfer" }
                     }
                 }
-                Log.d(TAG, "Successfully sent payload to $destinationIp")
+            }
+            output.flush()
+            check(DataInputStream(socket.getInputStream()).readUnsignedByte() == ACK_SUCCESS) {
+                "Receiver did not acknowledge this transfer"
+            }
+        }
+    }
+
+    override suspend fun send(payload: Payload, targetPeerId: String?): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                require(secureLink.configured.value) { "Enter a matching pairing phrase first" }
+                require(_state.value == TransportState.CONNECTED) { "Not connected over Wi-Fi Direct" }
+
+                val destinations = when {
+                    targetPeerId != null && targetPeerId.contains(".") -> {
+                        require(!isGroupOwner || connectedClientIps.contains(targetPeerId)) {
+                            "Target peer is not paired"
+                        }
+                        listOf(targetPeerId)
+                    }
+                    !isGroupOwner -> listOfNotNull(groupOwnerAddress)
+                    else -> connectedClientIps.toList()
+                }
+                check(destinations.isNotEmpty()) { "No authenticated Wi-Fi Direct peers" }
+
+                val failed = mutableListOf<String>()
+                for (address in destinations) {
+                    var delivered = false
+                    for (attempt in 0 until 3) {
+                        try {
+                            sendOnce(address, payload)
+                            delivered = true
+                            break
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Wi-Fi peer transfer attempt ${attempt + 1} failed", e)
+                            if (attempt < 2) delay((attempt + 1) * 450L)
+                        }
+                    }
+                    if (!delivered) failed.add(address)
+                }
+                check(failed.isEmpty()) {
+                    "No delivery confirmation from ${failed.joinToString()}"
+                }
                 Unit
             }
         }
-    }
 }
