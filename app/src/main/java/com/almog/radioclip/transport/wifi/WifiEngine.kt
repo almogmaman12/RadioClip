@@ -33,7 +33,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
-import java.io.EOFException
 import java.io.DataOutputStream
 import java.io.File
 import java.io.InputStream
@@ -55,7 +54,6 @@ class WifiEngine(
         private const val TAG = "WifiEngine"
         const val PORT = 8888
         private const val SOCKET_TIMEOUT_MS = 10000
-        private const val MAX_FILE_SIZE_BYTES = 512L * 1024 * 1024
 
         // Stream wire protocol tags
         private const val TYPE_TEXT: Byte = 1
@@ -575,29 +573,17 @@ class WifiEngine(
                         val mimeType = input.readUTF()
                         val fileSize = input.readLong()
 
-                        require(fileSize in 0..MAX_FILE_SIZE_BYTES) {
-                            "Invalid or oversized incoming file: $fileSize bytes"
-                        }
+                        FileTransferSafety.checkSize(fileSize)
 
                         // Strip any directory components from untrusted filenames. Use a
                         // generated prefix to prevent accidental overwrites or traversal.
-                        val safeName = fileName.substringAfterLast('/').substringAfterLast('\\')
-                            .replace(Regex("[\\x00-\\x1F\\x7F]"), "_")
-                            .take(120).ifBlank { "received_file" }
+                        val safeName = FileTransferSafety.safeName(fileName)
                         val receivedDir = File(context.filesDir, "received_files").apply { mkdirs() }
                         val targetFile = File(receivedDir, "${UUID.randomUUID()}-$safeName")
 
                         try {
                             targetFile.outputStream().use { out ->
-                                val buffer = ByteArray(64 * 1024)
-                                var remaining = fileSize
-                                while (remaining > 0) {
-                                    val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-                                    if (read < 0) throw EOFException("File transfer interrupted with $remaining bytes remaining")
-                                    if (read == 0) continue
-                                    out.write(buffer, 0, read)
-                                    remaining -= read
-                                }
+                                FileTransferSafety.copyExactly(input, out, fileSize)
                             }
                         } catch (e: Exception) {
                             targetFile.delete()
@@ -652,9 +638,7 @@ class WifiEngine(
                     }
 
                     is Payload.File -> {
-                        require(payload.sizeBytes in 0..MAX_FILE_SIZE_BYTES) {
-                            "File size is unknown, invalid or exceeds the 512 MB limit"
-                        }
+                        FileTransferSafety.checkSize(payload.sizeBytes)
                         output.writeByte(TYPE_FILE.toInt())
                         output.writeUTF(payload.id)
                         output.writeLong(payload.timestamp)
@@ -669,15 +653,7 @@ class WifiEngine(
                         } else null
 
                         inputStream?.use { stream ->
-                            val buffer = ByteArray(64 * 1024)
-                            var remaining = payload.sizeBytes
-                            while (remaining > 0L) {
-                                val read = stream.read(buffer, 0, minOf(remaining, buffer.size.toLong()).toInt())
-                                if (read < 0) throw EOFException("File ended before the reported size")
-                                if (read == 0) continue
-                                output.write(buffer, 0, read)
-                                remaining -= read
-                            }
+                            FileTransferSafety.copyExactly(stream, output, payload.sizeBytes)
                             require(stream.read() == -1) { "File is larger than the size reported by Android" }
                         } ?: error("Unable to open stream for file payload: ${payload.fileName}")
 
