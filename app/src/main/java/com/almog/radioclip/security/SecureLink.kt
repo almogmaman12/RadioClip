@@ -27,9 +27,9 @@ import javax.crypto.spec.SecretKeySpec
 class SecureLink(private val context: Context) {
     companion object {
         private const val KEYSTORE = "AndroidKeyStore"
-        private const val KEY_ALIAS = "radioclip-local-key-v2"
+        private const val KEY_ALIAS = "radioclip-local-key-v3"
         private const val PREFS = "radioclip-secure"
-        private const val KEY_DATA = "encrypted-peer-key"
+        private const val KEY_DATA = "encrypted-peer-key-v3"
         const val MIN_PAIRING_LENGTH = 5
         private const val PBKDF2_ITERATIONS = 240_000
         private val PAIRING_SALT = "RadioClip v2 pairing phrase AES-256".toByteArray(Charsets.UTF_8)
