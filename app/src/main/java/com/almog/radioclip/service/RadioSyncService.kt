@@ -86,12 +86,20 @@ class RadioSyncService : Service() {
     private val _pairingError = MutableStateFlow<String?>(null)
     val pairingError: StateFlow<String?> = _pairingError.asStateFlow()
 
+    private val _transferError = MutableStateFlow<String?>(null)
+    val transferError: StateFlow<String?> = _transferError.asStateFlow()
+
+    fun clearTransferError() {
+        _transferError.value = null
+    }
+
     fun setPairingPhrase(phrase: String) {
         serviceScope.launch(Dispatchers.Default) {
             try {
                 secureLink.configurePhrase(phrase)
                 wifiEngine.onPairingChanged()
                 _pairingError.value = null
+                _transferError.value = null
             } catch (e: Exception) {
                 _pairingError.value = e.message ?: "Unable to configure pairing"
             }
@@ -521,9 +529,15 @@ class RadioSyncService : Service() {
 
     fun connectToPeer(transportType: TransportType, peerId: String) {
         serviceScope.launch {
-            when (transportType) {
+            _transferError.value = null
+            val result = when (transportType) {
                 TransportType.BLE_GATT -> bleEngine.connect(peerId)
                 TransportType.WIFI_DIRECT_SOCKET -> wifiEngine.connect(peerId)
+            }
+            if (result.isFailure) {
+                val reason = result.exceptionOrNull()?.message ?: "Unknown connection error"
+                _transferError.value = "Connection failed: $reason"
+                Log.w(TAG, "Connection failed: $reason")
             }
         }
     }
@@ -543,8 +557,11 @@ class RadioSyncService : Service() {
             _history.value = (listOf(record) + _history.value).take(historyLimit)
 
             if (result.isFailure) {
-                Log.w(TAG, "Failed to route payload: ${result.exceptionOrNull()?.message}")
+                val reason = result.exceptionOrNull()?.message ?: "The other device did not confirm receipt"
+                _transferError.value = "Transfer failed: $reason"
+                Log.w(TAG, "Failed to route payload: $reason")
             } else {
+                _transferError.value = null
                 Log.d(TAG, "Payload routed successfully over $actualTransport")
             }
         }
