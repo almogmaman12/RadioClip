@@ -190,11 +190,20 @@ fun DashboardScreen(
                 }
             }
 
-            // Bluetooth Peers Section
+            // Keep connected peers visible when their advertisements become stale.
+            // Nearby results are deduplicated by RadioClip session ID, not MAC.
             item {
+                val allBlePeers = buildList {
+                    addAll(discoveredBlePeers)
+                    connectedBlePeers.forEach { connected ->
+                        if (discoveredBlePeers.none { it.id == connected.id }) {
+                            add(connected)
+                        }
+                    }
+                }
                 PeerSectionCard(
                     title = "Bluetooth Peers (BLE)",
-                    peers = discoveredBlePeers,
+                    peers = allBlePeers,
                     connectedPeers = connectedBlePeers,
                     emptyText = "Scanning for nearby RadioClip BLE devices...",
                     transportType = TransportType.BLE_GATT,
@@ -490,7 +499,11 @@ fun PeerSectionCard(
                                     style = MaterialTheme.typography.bodyMedium
                                 )
                                 Text(
-                                    text = peer.id,
+                                    text = if (transportType == TransportType.BLE_GATT &&
+                                        peer.id.length == 36
+                                    ) {
+                                        "RadioClip ID: ${peer.id.takeLast(8).uppercase()}"
+                                    } else peer.id,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
