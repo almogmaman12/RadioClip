@@ -36,6 +36,7 @@ class MainActivity : ComponentActivity() {
     private var isBound by mutableStateOf(false)
     private var pendingFilePayload: Payload.File? = null
     private var pendingSharedText: String? by mutableStateOf(null)
+    private var pendingNotificationClipboardSend = false
     private var windowCurrentlyFocused = false
     private var activityResumed = false
 
@@ -45,6 +46,7 @@ class MainActivity : ComponentActivity() {
             syncService = binder.getService()
             isBound = true
             syncService?.setWindowFocused(activityResumed && windowCurrentlyFocused)
+            trySendNotificationClipboard()
             pendingFilePayload?.let { file ->
                 syncService?.sendPayload(file)
                 pendingFilePayload = null
@@ -66,6 +68,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleExternalIntent(intent: Intent?) {
+        if (intent?.action == "ACTION_SYNC_CLIPBOARD_FROM_NOTIFICATION") {
+            pendingNotificationClipboardSend = true
+            trySendNotificationClipboard()
+            return
+        }
         if (intent?.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
             triggerFilePicker = true
             return
@@ -93,10 +100,19 @@ class MainActivity : ComponentActivity() {
         pendingSharedText = shared
     }
 
+    private fun trySendNotificationClipboard() {
+        if (pendingNotificationClipboardSend && activityResumed && windowCurrentlyFocused) {
+            val service = syncService ?: return
+            pendingNotificationClipboardSend = false
+            service.syncClipboardNow()
+        }
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         windowCurrentlyFocused = hasFocus
         syncService?.setWindowFocused(activityResumed && hasFocus)
+        trySendNotificationClipboard()
     }
 
     override fun onPause() {
@@ -109,6 +125,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         activityResumed = true
         if (windowCurrentlyFocused) syncService?.setWindowFocused(true)
+        trySendNotificationClipboard()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
