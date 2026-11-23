@@ -38,6 +38,9 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.text.input.VisualTransformation
+import java.security.SecureRandom
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -90,6 +93,7 @@ fun DashboardScreen(
     val context = LocalContext.current
     var textInput by remember { mutableStateOf("") }
     var pairingPhrase by remember { mutableStateOf("") }
+    var revealPairing by remember { mutableStateOf(false) }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -192,22 +196,42 @@ fun DashboardScreen(
                             onValueChange = { pairingPhrase = it },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            visualTransformation = PasswordVisualTransformation(),
+                            visualTransformation = if (revealPairing) VisualTransformation.None
+                                else PasswordVisualTransformation(),
                             label = { Text(if (pairingConfigured) "Change pairing phrase" else "Pairing phrase") },
                             placeholder = { Text("5+ characters, 12+ recommended") }
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
                             Button(
                                 enabled = pairingPhrase.length >= 5,
                                 onClick = {
                                     onPairingPhrase(pairingPhrase)
                                     pairingPhrase = ""
+                                    revealPairing = false
                                 }
                             ) {
-                                Text(if (pairingConfigured) "Update" else "Save phrase")
+                                Text(if (pairingConfigured) "Update code" else "Save code")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    val letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+                                    val random = SecureRandom()
+                                    pairingPhrase = (1..10)
+                                        .map { letters[random.nextInt(letters.length)] }
+                                        .joinToString("")
+                                    revealPairing = true
+                                }
+                            ) { Text("Generate") }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { revealPairing = !revealPairing }) {
+                                Text(if (revealPairing) "Hide code" else "Show code")
                             }
                             if (pairingConfigured) {
-                                OutlinedButton(onClick = onForgetPairing) { Text("Forget") }
+                                TextButton(onClick = onForgetPairing) { Text("Forget saved code") }
                             }
                         }
                         pairingError?.let { error ->
