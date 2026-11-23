@@ -46,6 +46,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -85,6 +86,8 @@ fun DashboardScreen(
     pairingError: String?,
     transferError: String?,
     onClearTransferError: () -> Unit,
+    sharedText: String?,
+    onSharedTextConsumed: () -> Unit,
     onPairingPhrase: (String) -> Unit,
     onForgetPairing: () -> Unit,
     onConnectPeer: (transportType: TransportType, peerId: String) -> Unit,
@@ -96,6 +99,13 @@ fun DashboardScreen(
     var textInput by remember { mutableStateOf("") }
     var pairingPhrase by remember { mutableStateOf("") }
     var revealPairing by remember { mutableStateOf(false) }
+
+    LaunchedEffect(sharedText) {
+        if (!sharedText.isNullOrBlank()) {
+            textInput = sharedText
+            onSharedTextConsumed()
+        }
+    }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
