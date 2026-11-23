@@ -106,6 +106,7 @@ class BleEngine(
     private val scannedDevicesMap = ConcurrentHashMap<String, BluetoothDevice>()
     private val localDiscoveryId = BleDiscoveryIdentity.newSessionUuid()
     private val peerDirectory = BlePeerDirectory()
+    private val connectedPeerAddresses = ConcurrentHashMap<String, String>()
     private var peerCleanupJob: Job? = null
     private val clientMtuMap = ConcurrentHashMap<String, Int>()
     private val sendMutex = Mutex()
@@ -306,6 +307,7 @@ class BleEngine(
         targetReconnectAddresses.clear()
         scannedDevicesMap.clear()
         peerDirectory.clear()
+        connectedPeerAddresses.clear()
         _discoveredPeers.value = emptyList()
         _connectedPeers.value = emptyList()
         _state.value = TransportState.IDLE
@@ -455,12 +457,9 @@ class BleEngine(
         }
     }
 
-    private fun stablePeerIdForAddress(address: String): String =
-        peerDirectory.identityForAddress(address, SystemClock.elapsedRealtime())
-            ?.toString() ?: address
-
     private fun targetBleAddress(targetPeerId: String?): String? {
         if (targetPeerId == null) return null
+        connectedPeerAddresses[targetPeerId]?.let { return it }
         val identity = runCatching { UUID.fromString(targetPeerId) }.getOrNull()
             ?: return targetPeerId
         return peerDirectory.latestAddress(identity, SystemClock.elapsedRealtime())
@@ -486,7 +485,13 @@ class BleEngine(
 
         scannedDevicesMap[device.address] = device
         peerDirectory.observe(identity, device.address, name, now)
-        publishDiscoveredPeers()
+        // A server-side connection may have arrived before its identity
+        // advertisement. Upgrade the raw address entry when it is known.
+        if (_connectedPeers.value.any { it.id == device.address }) {
+            updateConnectedPeers(device.address, name, true)
+        } else {
+            publishDiscoveredPeers()
+        }
     }
 
     override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.IO) {
@@ -674,10 +679,16 @@ class BleEngine(
     }
 
     private fun updateConnectedPeers(address: String, name: String, isConnected: Boolean) {
-        val stableId = stablePeerIdForAddress(address)
+        val previousId = connectedPeerAddresses.entries.firstOrNull { it.value == address }?.key
+        val stableId = peerDirectory.identityForAddress(address, SystemClock.elapsedRealtime())
+            ?.toString() ?: previousId ?: address
         val current = _connectedPeers.value.toMutableList()
-        current.removeAll { it.id == address || it.id == stableId }
+        current.removeAll { it.id == address || it.id == stableId || it.id == previousId }
         if (isConnected) {
+            if (previousId != null && previousId != stableId) {
+                connectedPeerAddresses.remove(previousId, address)
+            }
+            connectedPeerAddresses[stableId] = address
             val discoveredName = peerDirectory.snapshot(SystemClock.elapsedRealtime())
                 .firstOrNull { it.identity.toString() == stableId }?.name
             current.add(
@@ -688,6 +699,8 @@ class BleEngine(
                     isConnected = true
                 )
             )
+        } else {
+            connectedPeerAddresses.remove(stableId, address)
         }
         _connectedPeers.value = current
         publishDiscoveredPeers()
