@@ -167,13 +167,54 @@ class RadioSyncService : Service() {
         }
     }
 
+    /**
+     * Explicit user-triggered clipboard transfer. Unlike automatic sync this
+     * is allowed even when the background auto-sync preference is disabled.
+     */
     fun syncClipboardNow() {
         if (!windowFocused) {
-            _clipboardSyncStatus.value = "Bring RadioClip to the foreground to read clipboard"
+            _clipboardSyncStatus.value = "Keep RadioClip open while sending clipboard"
             return
         }
-        inspectFocusedClipboard()
-        flushPendingClipboard()
+        if (!secureLink.configured.value) {
+            _clipboardSyncStatus.value = "Set up your pairing code first"
+            return
+        }
+        val manager = clipboardManager
+        if (manager == null) {
+            _clipboardSyncStatus.value = "Clipboard service is unavailable"
+            return
+        }
+        try {
+            val clip = manager.primaryClip
+            if (clip == null || clip.itemCount == 0) {
+                _clipboardSyncStatus.value = "Clipboard is empty"
+                return
+            }
+            val description = clip.description
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE) == true
+            ) {
+                _clipboardSyncStatus.value = "Sensitive clipboard skipped for safety"
+                return
+            }
+            val text = clip.getItemAt(0).text?.toString()
+            if (text.isNullOrBlank()) {
+                _clipboardSyncStatus.value = "No plain text found; try copying text first"
+                return
+            }
+            if (text.toByteArray(Charsets.UTF_8).size > 1024 * 1024) {
+                _clipboardSyncStatus.value = "Clipboard too large; share it as a file"
+                return
+            }
+            pendingLocalClipboardText = text
+            flushPendingClipboard(force = true)
+        } catch (e: SecurityException) {
+            _clipboardSyncStatus.value = "Clipboard permission denied; paste text into Send"
+        } catch (e: Exception) {
+            Log.w(TAG, "Manual clipboard send failed", e)
+            _clipboardSyncStatus.value = "Cannot read clipboard; paste text into Send"
+        }
     }
 
     inner class LocalBinder : Binder() {
@@ -363,11 +404,11 @@ class RadioSyncService : Service() {
     }
 
     /** Transport completion must be confirmed before a copy is considered synced. */
-    private fun flushPendingClipboard() {
-        if (!_clipboardSyncEnabled.value || !secureLink.configured.value) return
+    private fun flushPendingClipboard(force: Boolean = false) {
+        if ((!force && !_clipboardSyncEnabled.value) || !secureLink.configured.value) return
         serviceScope.launch {
             clipboardSendMutex.withLock {
-                while (_clipboardSyncEnabled.value && secureLink.configured.value) {
+                while ((force || _clipboardSyncEnabled.value) && secureLink.configured.value) {
                     val text = pendingLocalClipboardText ?: break
                     _clipboardSyncStatus.value = "Sending clipboard..."
                     val payload = Payload.Text(content = text, isOutgoing = true)
