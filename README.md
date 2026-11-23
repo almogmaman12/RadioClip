@@ -6,7 +6,7 @@
 ---
 
 > [!IMPORTANT]
-> **Status: Public Beta (v1.0-beta)**  
+> **Status: Development Beta (v2.4.0-beta)**  
 > RadioClip is actively evolving. Transport reliability is being repaired. Real-device BLE and Wi-Fi Direct testing is still required before using the app for important data.
 
 ---
@@ -14,7 +14,7 @@
 ## 🌟 Overview
 
 **RadioClip** turns your Android device into an autonomous local data radio station. It creates direct device-to-device wireless mesh links to synchronize clipboard text and transfer local files without:
-- ❌ Internet connectivity or Wi-Fi routers
+- ❌ External internet access or Wi-Fi routers
 - ❌ External servers, cloud sync, or accounts
 - ❌ Tracking, telemetry, or user data harvesting
 
@@ -45,15 +45,16 @@ All communications occur over standard local RF interfaces (`Bluetooth LE` and `
 ## 🔒 Security & Privacy
 
 > [!IMPORTANT]
-> **All devices must run protocol v2 and enter the same 16+ character pairing phrase (letters and numbers).** Enter the phrase on both devices in the dashboard. Earlier builds are not protocol-compatible.
+> **All devices must run protocol v2 and enter the same pairing code (minimum 5 characters; 12+ random characters strongly recommended).** Enter the phrase on both devices in the dashboard. Earlier builds are not protocol-compatible.
 >
-> - Text and file contents are encrypted and authenticated with AES-256-GCM. A shared key is derived using PBKDF2-HMAC-SHA256; Android Keystore protects its on-device storage. The phrase is never sent over BLE or Wi-Fi Direct.
+> - Five-character codes are **weak** and vulnerable to guessing, even though traffic is encrypted. Use a long random code for private files.
+> - Text and file contents are encrypted and authenticated with AES-256-GCM. A shared key is derived using PBKDF2-HMAC-SHA256; Android Keystore protects its on-device storage. Encryption always uses provider-generated AES-GCM IVs to avoid Android Keystore's caller-provided-IV restriction. The phrase is never sent over BLE or Wi-Fi Direct.
 > - Both transports use receiver acknowledgements and bounded retry attempts; Wi-Fi file chunks are authenticated individually and saved only after all chunks pass verification.
 > - **The pairing phrase is shared-group authentication, not verified device identity.** Anyone with the phrase could join the group. Wi-Fi file names, MIME types and sizes are not hidden from the peer network.
 > - This is still a development build. It has not been validated on two physical devices, and it has no formal security audit. Avoid transmitting sensitive credentials until you have tested and evaluated the risks.
 > - Clipboard sync is **off by default**. Android 10+ allows ordinary apps to read the clipboard only when they have input focus (or when they are the system's default keyboard). A foreground service is **not** an exception. When enabled, RadioClip detects new plain-text clipboard contents while its window is focused, and checks again when you return to it after copying in another app. It skips clips marked sensitive and retries a pending clipboard transfer when a peer reconnects.
-- To send text without returning first, use **Share → RadioClip** (or the **Process text** selection action where supported). This is an explicit Android-supported send, not background clipboard surveillance.
-- The UI reports **Watching**, **Paused**, **Sending**, **Not delivered**, or **Delivered**, and has a **Sync clipboard now** action. Incoming text remains available in Activity History with a **Copy text** button when your device restricts applying the received clipboard.
+- To send copied text from another app, use **Share → RadioClip**, the selection action **Process text**, or the **Send clipboard** action on RadioClip's ongoing notification. The notification brings RadioClip into focus before reading the clipboard. The shared text fills the send field for confirmation.
+- The UI reports **Watching**, **Paused**, **Sending**, **Not delivered**, or **Delivered**, and has a **Send current clipboard** action which works even if automatic sync is off. Incoming text remains available in Activity History with a **Copy text** button when your device restricts applying the received clipboard.
 > - No accounts, servers, telemetry or external analytics are used. The Android `INTERNET` permission is required for local TCP sockets, not cloud access.
 
 ## 📦 Building & Generating APK
