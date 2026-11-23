@@ -108,7 +108,13 @@ class RadioSyncService : Service() {
 
     fun forgetPairingPhrase() {
         secureLink.forgetPhrase()
+        wifiEngine.onPairingChanged()
         setClipboardSyncEnabled(false)
+        pendingLocalClipboardText = null
+        lastRemoteClipboardText = null
+        lastDeliveredClipboardText = null
+        _pairingError.value = null
+        _transferError.value = null
     }
 
     private val _history = MutableStateFlow<List<Payload>>(emptyList())
