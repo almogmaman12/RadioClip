@@ -25,6 +25,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.almog.radioclip.security.SecureLink
@@ -48,6 +49,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -102,6 +104,9 @@ class BleEngine(
     private val activeGattClients = ConcurrentHashMap<String, BluetoothGatt>()
     private val serverConnectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
     private val scannedDevicesMap = ConcurrentHashMap<String, BluetoothDevice>()
+    private val localDiscoveryId = BleDiscoveryIdentity.newSessionUuid()
+    private val peerDirectory = BlePeerDirectory()
+    private var peerCleanupJob: Job? = null
     private val clientMtuMap = ConcurrentHashMap<String, Int>()
     private val sendMutex = Mutex()
 
@@ -268,9 +273,18 @@ class BleEngine(
         setupGattServer()
         startAdvertising()
         startScanning()
+        peerCleanupJob?.cancel()
+        peerCleanupJob = scope.launch {
+            while (isActive) {
+                delay(10_000L)
+                publishDiscoveredPeers()
+            }
+        }
     }
 
     override suspend fun stop() = withContext(Dispatchers.IO) {
+        peerCleanupJob?.cancel()
+        peerCleanupJob = null
         stopScanning()
         stopAdvertising()
         closeGattServer()
@@ -291,6 +305,7 @@ class BleEngine(
         incomingPacketBuffers.clear()
         targetReconnectAddresses.clear()
         scannedDevicesMap.clear()
+        peerDirectory.clear()
         _discoveredPeers.value = emptyList()
         _connectedPeers.value = emptyList()
         _state.value = TransportState.IDLE
@@ -341,9 +356,12 @@ class BleEngine(
             .addServiceUuid(ParcelUuid(SERVICE_UUID))
             .build()
 
-        // Include device name in scan response packet so it fits in 31-byte BLE legacy advertising limit
+        // A second 128-bit RadioClip UUID in the scan response is a transient
+        // advertiser-session identity. A tablet's BLE address can rotate many
+        // times while it is still the same device; its session ID remains stable.
+        // This field fits within the 31-byte legacy scan response limit.
         val scanResponse = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
+            .addServiceUuid(ParcelUuid(localDiscoveryId))
             .build()
 
         try {
@@ -416,36 +434,59 @@ class BleEngine(
             ?: "RadioClip (${device.address.takeLast(5)})"
     }
 
-    private fun handleScanResult(result: ScanResult) {
-        val device = result.device ?: return
-        val record = result.scanRecord
-
-        val hasOurServiceUuid = record?.serviceUuids?.any { it.uuid == SERVICE_UUID } == true
-        if (!hasOurServiceUuid) return
-
-        val address = device.address
-        val name = getDeviceDisplayName(device, record?.deviceName)
-        scannedDevicesMap[address] = device
-
-        val currentDiscovered = _discoveredPeers.value.toMutableList()
-        val existingIndex = currentDiscovered.indexOfFirst { it.id == address }
-        val peer = PeerDevice(
-            id = address,
-            name = name,
-            transportType = TransportType.BLE_GATT,
-            isConnected = _connectedPeers.value.any { it.id == address }
-        )
-
-        if (existingIndex == -1) {
-            currentDiscovered.add(peer)
-            _discoveredPeers.value = currentDiscovered
-            Log.d(TAG, "Discovered RadioClip BLE peer: $name ($address)")
-        } else if (currentDiscovered[existingIndex] != peer) {
-            currentDiscovered[existingIndex] = peer
-            _discoveredPeers.value = currentDiscovered
+    private fun publishDiscoveredPeers() {
+        val now = SystemClock.elapsedRealtime()
+        val available = peerDirectory.snapshot(now)
+        val addresses = available.map { it.address }.toSet()
+        scannedDevicesMap.keys.removeIf {
+            it !in addresses &&
+                !activeGattClients.containsKey(it) &&
+                !serverConnectedDevices.containsKey(it)
         }
+        _discoveredPeers.value = available.map { seen ->
+            PeerDevice(
+                id = seen.identity.toString(),
+                name = seen.name,
+                transportType = TransportType.BLE_GATT,
+                isConnected = _connectedPeers.value.any {
+                    it.id == seen.identity.toString() || it.id == seen.address
+                }
+            )
+        }
+    }
 
-        // Connection requires a deliberate tap: never auto-connect to unknown peers.
+    private fun stablePeerIdForAddress(address: String): String =
+        peerDirectory.identityForAddress(address, SystemClock.elapsedRealtime())
+            ?.toString() ?: address
+
+    private fun targetBleAddress(targetPeerId: String?): String? {
+        if (targetPeerId == null) return null
+        val identity = runCatching { UUID.fromString(targetPeerId) }.getOrNull()
+            ?: return targetPeerId
+        return peerDirectory.latestAddress(identity, SystemClock.elapsedRealtime())
+    }
+
+    private fun handleScanResult(result: ScanResult) {
+        val record = result.scanRecord ?: return
+        val uuids = record.serviceUuids?.map { it.uuid } ?: return
+        if (SERVICE_UUID !in uuids) return
+
+        // Do not accept bare RadioClip service UUIDs as separate devices.
+        // Earlier builds and scan packets missing their identity cannot safely
+        // distinguish a rotating address from an entirely new device.
+        val identity = BleDiscoveryIdentity.fromAdvertisedUuids(uuids, localDiscoveryId)
+            ?: return
+        val device = result.device ?: return
+        val now = SystemClock.elapsedRealtime()
+        val existing = peerDirectory.snapshot(now).firstOrNull { it.identity == identity }
+        val detectedName = record.deviceName ?: try { device.name } catch (_: SecurityException) { null }
+        val name = detectedName?.takeIf { it.isNotBlank() }
+            ?: existing?.name
+            ?: "RadioClip ${identity.toString().takeLast(8).uppercase()}"
+
+        scannedDevicesMap[device.address] = device
+        peerDirectory.observe(identity, device.address, name, now)
+        publishDiscoveredPeers()
     }
 
     override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.IO) {
@@ -453,16 +494,20 @@ class BleEngine(
             if (!hasBlePermissions()) {
                 error("Missing Bluetooth Connect permissions")
             }
-            val device = scannedDevicesMap[peerId]
-                ?: bluetoothAdapter?.getRemoteDevice(peerId)
-                ?: error("Bluetooth device $peerId not found")
+            val address = targetBleAddress(peerId)
+                ?: error("RadioClip peer is no longer nearby; scan again")
+            val device = scannedDevicesMap[address]
+                ?: bluetoothAdapter?.getRemoteDevice(address)
+                ?: error("Bluetooth device $address not found")
 
-            targetReconnectAddresses.add(peerId)
+            targetReconnectAddresses.add(address)
             stopScanning()
             try {
                 connectToPeerDevice(device)
                 val ready = withTimeoutOrNull(15_000L) {
-                    connectedPeers.first { peers -> peers.any { it.id == peerId } }
+                    connectedPeers.first { peers ->
+                        peers.any { it.id == peerId || it.id == address }
+                    }
                 }
                 check(ready != null) { "BLE peer did not complete GATT connection within 15 seconds" }
             } finally {
@@ -629,17 +674,23 @@ class BleEngine(
     }
 
     private fun updateConnectedPeers(address: String, name: String, isConnected: Boolean) {
+        val stableId = stablePeerIdForAddress(address)
         val current = _connectedPeers.value.toMutableList()
-        current.removeAll { it.id == address }
+        current.removeAll { it.id == address || it.id == stableId }
         if (isConnected) {
-            current.add(PeerDevice(id = address, name = name, transportType = TransportType.BLE_GATT, isConnected = true))
+            val discoveredName = peerDirectory.snapshot(SystemClock.elapsedRealtime())
+                .firstOrNull { it.identity.toString() == stableId }?.name
+            current.add(
+                PeerDevice(
+                    id = stableId,
+                    name = discoveredName ?: name,
+                    transportType = TransportType.BLE_GATT,
+                    isConnected = true
+                )
+            )
         }
         _connectedPeers.value = current
-
-        val discovered = _discoveredPeers.value.map { peer ->
-            if (peer.id == address) peer.copy(isConnected = isConnected) else peer
-        }
-        _discoveredPeers.value = discovered
+        publishDiscoveredPeers()
 
         if (_connectedPeers.value.isNotEmpty()) {
             _state.value = TransportState.CONNECTED
@@ -681,9 +732,13 @@ class BleEngine(
                 val data = secureLink.seal(payload.content.toByteArray(Charsets.UTF_8), aad)
                 require(data.size <= MAX_MESSAGE_BYTES) { "Encrypted BLE message exceeds 20 KB" }
 
-                // Check active clients
-                val clients = if (targetPeerId != null) {
-                    listOfNotNull(activeGattClients[targetPeerId])
+                // Resolve the stable UI identity to its latest BLE address.
+                val targetAddress = targetBleAddress(targetPeerId)
+                if (targetPeerId != null && targetAddress == null) {
+                    error("RadioClip peer is no longer nearby")
+                }
+                val clients = if (targetAddress != null) {
+                    listOfNotNull(activeGattClients[targetAddress])
                 } else {
                     activeGattClients.values.toList()
                 }.filter { readyClientAddresses.contains(it.device.address) }
@@ -691,8 +746,8 @@ class BleEngine(
                 // A device may connect as a GATT client or as a server. Broadcast to
                 // both kinds, but avoid sending the same text twice to one address.
                 val clientAddresses = clients.map { it.device.address }.toSet()
-                val serverDevices = if (targetPeerId != null) {
-                    listOfNotNull(serverConnectedDevices[targetPeerId])
+                val serverDevices = if (targetAddress != null) {
+                    listOfNotNull(serverConnectedDevices[targetAddress])
                 } else {
                     serverConnectedDevices.values.toList()
                 }.filter {
