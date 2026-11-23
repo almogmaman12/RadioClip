@@ -792,7 +792,12 @@ fun PayloadItem(payload: Payload) {
                             )
                         }
 
-                        // Only received files already saved locally are available to open.
+                        if (!payload.isOutgoing && payload.localPath != null) {
+                            OutlinedButton(
+                                onClick = { shareReceivedFile(context, payload) },
+                                shape = RoundedCornerShape(8.dp)
+                            ) { Text("Share") }
+                        }
                         FilledTonalButton(
                             onClick = {
                                 openFileIntent(context, payload)
@@ -805,6 +810,28 @@ fun PayloadItem(payload: Payload) {
                 }
             }
         }
+    }
+}
+
+private fun shareReceivedFile(context: Context, filePayload: Payload.File) {
+    try {
+        val file = filePayload.localPath?.let { java.io.File(it) }
+        if (file == null || !file.isFile) {
+            android.widget.Toast.makeText(context, "File no longer exists", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            context, "${context.packageName}.fileprovider", file
+        )
+        val share = Intent(Intent.ACTION_SEND).apply {
+            type = filePayload.mimeType.ifBlank { "application/octet-stream" }
+            putExtra(Intent.EXTRA_STREAM, uri)
+            clipData = ClipData.newRawUri(filePayload.fileName, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(share, "Save or share received file"))
+    } catch (e: Exception) {
+        android.widget.Toast.makeText(context, "Could not share file: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
     }
 }
 
