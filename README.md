@@ -30,7 +30,8 @@ All communications occur over standard local RF interfaces (`Bluetooth LE` and `
 - **📱 Background Sync Service**:
   - Runs a foreground persistent Android Service (`connectedDevice`) maintaining radio liveness and listening for incoming payloads.
 - **👥 App-Specific Peer Discovery & Manual Connect**:
-  - BLE discovery is filtered by RadioClip's Bluetooth service UUID.
+  - BLE discovery requires RadioClip's service UUID and a separate transient session identity in its scan response. This groups rotating Bluetooth MAC addresses into one peer row, expires stale results after 45 seconds, and bounds the list to 24 entries.
+  - Each RadioClip service start creates a new temporary identity; the app does not broadcast a permanent installation identifier. Bluetooth peers using the older APK cannot be discovered by this build.
   - Wi-Fi Direct advertises and discovers the `RadioClip._radioclip._tcp` DNS-SD service; unrelated devices are not listed.
   - Install this version on both devices. Keep Wi-Fi and Location enabled, open RadioClip on each phone, enter matching pairing phrases, then select a discovered peer.
   - Service discovery is not proof of trust. Transfers require the encrypted authenticated handshake.
@@ -114,7 +115,8 @@ security/
 The `.github/workflows/android-ci.yml` workflow runs unit tests, builds a debug APK and uploads an artifact named **RadioClip-debug-apk** on successful runs. Download the artifact ZIP from the latest successful workflow run and extract `app-debug.apk` to install. Debug builds are not Play Store releases.
 
 For a meaningful two-device release test, exercise:
-- Enter the same phrase on two phones, confirm encrypted BLE discovery/connect and text transfer in **both** directions, including Unicode, retries and reconnection. Verify that a wrong phrase cannot receive messages.
+- Install the new APK on both devices. Confirm BLE scans show **one row per device** even if its private Bluetooth address rotates, and that expired peers disappear after 45 seconds while connected peers stay visible.
+- Enter the same phrase on two phones; confirm encrypted BLE discovery/connect and text transfer in **both** directions, including Unicode, retries and reconnection. Verify that a wrong phrase cannot receive messages.
 - Wi-Fi Direct encrypted text and file transfer both ways, correct pairing before/after connection, no duplicate deliveries after retries, and the 512 MB limit.
 - Android permission denial, Bluetooth/Wi-Fi toggling, app rotation, and service shutdown.
 - Clipboard opt-in behavior in foreground and background, including Android 10+ clipboard restrictions.
