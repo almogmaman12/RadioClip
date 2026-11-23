@@ -167,6 +167,63 @@ fun DashboardScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // Each phone must have the same locally entered passphrase.
+            // Without it, no payloads are accepted or transmitted.
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Secure connection", style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold)
+                        Text(
+                            if (pairingConfigured) "Pairing phrase is configured"
+                            else "Enter the same private phrase on both devices before transferring.",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        OutlinedTextField(
+                            value = pairingPhrase,
+                            onValueChange = { pairingPhrase = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            label = { Text(if (pairingConfigured) "Change pairing phrase" else "Pairing phrase") },
+                            placeholder = { Text("5+ characters, 12+ recommended") }
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                enabled = pairingPhrase.length >= 5,
+                                onClick = {
+                                    onPairingPhrase(pairingPhrase)
+                                    pairingPhrase = ""
+                                }
+                            ) {
+                                Text(if (pairingConfigured) "Update" else "Save phrase")
+                            }
+                            if (pairingConfigured) {
+                                OutlinedButton(onClick = onForgetPairing) { Text("Forget") }
+                            }
+                        }
+                        pairingError?.let { error ->
+                            Text(error, color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text(
+                            "Both phones must use exactly the same code. " +
+                                "A 5-character code is convenient but much easier to guess. " +
+                                "Use 12 or more random characters for sensitive transfers.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+
             // Transport Status Cards
             item {
                 Row(
@@ -234,65 +291,6 @@ fun DashboardScreen(
                 )
             }
 
-            // Each phone must have the same locally entered passphrase.
-            // Without it, no payloads are accepted or transmitted.
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("Secure connection", style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold)
-                        Text(
-                            if (pairingConfigured) "Pairing phrase is configured"
-                            else "Enter the same private phrase on both devices before transferring.",
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        OutlinedTextField(
-                            value = pairingPhrase,
-                            onValueChange = { pairingPhrase = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            visualTransformation = PasswordVisualTransformation(),
-                            label = { Text(if (pairingConfigured) "Change pairing phrase" else "Pairing phrase") },
-                            placeholder = { Text("16+ characters, letters and numbers") }
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                enabled = pairingPhrase.length >= 16 &&
-                                    pairingPhrase.any { it.isLetter() } &&
-                                    pairingPhrase.any { it.isDigit() },
-                                onClick = {
-                                    onPairingPhrase(pairingPhrase)
-                                    pairingPhrase = ""
-                                }
-                            ) {
-                                Text(if (pairingConfigured) "Update" else "Save phrase")
-                            }
-                            if (pairingConfigured) {
-                                OutlinedButton(onClick = onForgetPairing) { Text("Forget") }
-                            }
-                        }
-                        pairingError?.let { error ->
-                            Text(error, color = MaterialTheme.colorScheme.error,
-                                style = MaterialTheme.typography.bodySmall)
-                        }
-                        Text(
-                            "AES-256-GCM protects transferred text and file contents. " +
-                                "The phrase is never sent over the radio. Use a long unique phrase; " +
-                                "any device with the phrase can join this sharing group.",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-            }
-
             // Android restricts background clipboard reads. Require opt-in.
             item {
                 Card(
@@ -306,7 +304,7 @@ fun DashboardScreen(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text("Clipboard sync while app is active", fontWeight = FontWeight.SemiBold)
+                                Text("Auto-sync when RadioClip is open", fontWeight = FontWeight.SemiBold)
                                 Text(
                                     if (clipboardSyncEnabled) "On" else "Off",
                                     style = MaterialTheme.typography.bodySmall
@@ -328,16 +326,15 @@ fun DashboardScreen(
                             else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         OutlinedButton(
-                            enabled = clipboardSyncEnabled && pairingConfigured,
+                            enabled = pairingConfigured,
                             onClick = onSyncClipboardNow
                         ) {
-                            Text("Sync clipboard now")
+                            Text("Send current clipboard")
                         }
                         Text(
-                            "Android 10+ blocks clipboard reads from other apps while " +
-                                "RadioClip is in the background. Copy something, then return " +
-                                "here to sync it, or use Share → RadioClip in the other app. " +
-                                "Only enable this with trusted devices.",
+                            "Copy text in another app, return to RadioClip, then tap " +
+                                "Send current clipboard. Auto-sync only works while this app " +
+                                "has focus. For instant sending use Share → RadioClip.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
