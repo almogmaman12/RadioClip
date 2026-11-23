@@ -8,10 +8,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.security.KeyStore
-import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKeyFactory
-import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
@@ -33,8 +31,6 @@ class SecureLink(private val context: Context) {
         const val MIN_PAIRING_LENGTH = 5
         private const val PBKDF2_ITERATIONS = 240_000
         private val PAIRING_SALT = "RadioClip v2 pairing phrase AES-256".toByteArray(Charsets.UTF_8)
-        private const val IV_LENGTH = 12
-        private const val TAG_BITS = 128
     }
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -49,10 +45,7 @@ class SecureLink(private val context: Context) {
             val stored = prefs.getString(KEY_DATA, null)
             if (stored != null) {
                 val contents = Base64.decode(stored, Base64.NO_WRAP)
-                require(contents.size > IV_LENGTH)
-                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                cipher.init(Cipher.DECRYPT_MODE, localStorageKey(), GCMParameterSpec(TAG_BITS, contents, 0, IV_LENGTH))
-                val decoded = cipher.doFinal(contents, IV_LENGTH, contents.size - IV_LENGTH)
+                val decoded = GcmEnvelope.open(localStorageKey(), contents)
                 require(decoded.size == 32)
                 peerKey = SecretKeySpec(decoded, "AES")
                 decoded.fill(0)
@@ -78,13 +71,9 @@ class SecureLink(private val context: Context) {
             spec.clearPassword()
         }
         try {
-            // Android Keystore AES-GCM keys reject caller-provided IVs on encryption.
-            // Let the provider generate a fresh nonce and persist it alongside ciphertext.
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, localStorageKey())
-            val iv = cipher.iv
-            check(iv.size == IV_LENGTH) { "Unexpected Android Keystore GCM IV size" }
-            val encrypted = iv + cipher.doFinal(derived)
+            // One tested helper handles Android Keystore and software peer keys,
+            // always using a provider-generated nonce.
+            val encrypted = GcmEnvelope.seal(localStorageKey(), derived)
             check(prefs.edit().putString(KEY_DATA, Base64.encodeToString(encrypted, Base64.NO_WRAP)).commit()) {
                 "Could not persist the pairing key"
             }
@@ -105,23 +94,12 @@ class SecureLink(private val context: Context) {
     /** Returns [12-byte IV][AES-GCM encrypted bytes + 16-byte tag]. */
     fun seal(plaintext: ByteArray, aad: ByteArray = byteArrayOf()): ByteArray {
         val key = peerKey ?: error("Enter a pairing phrase before sending")
-        // Never supply an IV while initializing an encryption cipher.
-        // Android Keystore and some providers prohibit caller-provided IVs.
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key)
-        val iv = cipher.iv
-        check(iv.size == IV_LENGTH) { "AES-GCM returned an unexpected nonce length" }
-        cipher.updateAAD(aad)
-        return iv + cipher.doFinal(plaintext)
+        return GcmEnvelope.seal(key, plaintext, aad)
     }
 
     fun open(envelope: ByteArray, aad: ByteArray = byteArrayOf()): ByteArray {
         val key = peerKey ?: error("Enter a pairing phrase before receiving")
-        require(envelope.size >= IV_LENGTH + TAG_BITS / 8) { "Truncated encrypted payload" }
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, envelope, 0, IV_LENGTH))
-        cipher.updateAAD(aad)
-        return cipher.doFinal(envelope, IV_LENGTH, envelope.size - IV_LENGTH)
+        return GcmEnvelope.open(key, envelope, aad)
     }
 
     /** 96-bit MAC used for BLE delivery acknowledgements within a 23-byte MTU. */
@@ -132,9 +110,9 @@ class SecureLink(private val context: Context) {
         return mac.doFinal(message).copyOf(12)
     }
 
-    private fun localStorageKey(): java.security.Key {
+    private fun localStorageKey(): javax.crypto.SecretKey {
         val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
-        keyStore.getKey(KEY_ALIAS, null)?.let { return it }
+        (keyStore.getKey(KEY_ALIAS, null) as? javax.crypto.SecretKey)?.let { return it }
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE).run {
             init(
                 KeyGenParameterSpec.Builder(
