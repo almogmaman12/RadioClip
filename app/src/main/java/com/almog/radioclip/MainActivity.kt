@@ -35,7 +35,7 @@ class MainActivity : ComponentActivity() {
     private var syncService: RadioSyncService? by mutableStateOf(RadioSyncService.activeInstance)
     private var isBound by mutableStateOf(false)
     private var pendingFilePayload: Payload.File? = null
-    private var pendingSharedText: String? = null
+    private var pendingSharedText: String? by mutableStateOf(null)
     private var windowCurrentlyFocused = false
     private var activityResumed = false
 
@@ -45,10 +45,6 @@ class MainActivity : ComponentActivity() {
             syncService = binder.getService()
             isBound = true
             syncService?.setWindowFocused(activityResumed && windowCurrentlyFocused)
-            pendingSharedText?.let { shared ->
-                syncService?.sendPayload(Payload.Text(content = shared))
-                pendingSharedText = null
-            }
             pendingFilePayload?.let { file ->
                 syncService?.sendPayload(file)
                 pendingFilePayload = null
@@ -92,11 +88,9 @@ class MainActivity : ComponentActivity() {
             ).show()
             return
         }
-        if (syncService != null) {
-            syncService?.sendPayload(Payload.Text(content = shared))
-        } else {
-            pendingSharedText = shared
-        }
+        // Fill the compose field so users can choose when and to whom to
+        // transfer their shared clipboard text. Never silently discard it.
+        pendingSharedText = shared
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -229,6 +223,8 @@ class MainActivity : ComponentActivity() {
                     pairingError = pairingError,
                     transferError = transferError,
                     onClearTransferError = { currentService?.clearTransferError() },
+                    sharedText = pendingSharedText,
+                    onSharedTextConsumed = { pendingSharedText = null },
                     onPairingPhrase = { currentService?.setPairingPhrase(it) },
                     onForgetPairing = { currentService?.forgetPairingPhrase() },
                     onConnectPeer = { transportType, peerId ->
