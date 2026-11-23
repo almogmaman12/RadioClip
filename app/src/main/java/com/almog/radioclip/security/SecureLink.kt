@@ -8,7 +8,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.security.KeyStore
-import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKeyFactory
@@ -31,11 +30,11 @@ class SecureLink(private val context: Context) {
         private const val KEY_ALIAS = "radioclip-local-key-v2"
         private const val PREFS = "radioclip-secure"
         private const val KEY_DATA = "encrypted-peer-key"
+        const val MIN_PAIRING_LENGTH = 5
         private const val PBKDF2_ITERATIONS = 240_000
         private val PAIRING_SALT = "RadioClip v2 pairing phrase AES-256".toByteArray(Charsets.UTF_8)
         private const val IV_LENGTH = 12
         private const val TAG_BITS = 128
-        private val random = SecureRandom()
     }
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -69,8 +68,8 @@ class SecureLink(private val context: Context) {
 
     @Synchronized
     fun configurePhrase(phrase: String) {
-        require(phrase.length >= 16 && phrase.any { it.isLetter() } && phrase.any { it.isDigit() }) {
-            "Use a pairing phrase of at least 16 characters with letters and numbers"
+        require(phrase.length >= MIN_PAIRING_LENGTH) {
+            "Enter at least $MIN_PAIRING_LENGTH characters for pairing"
         }
         val spec = PBEKeySpec(phrase.toCharArray(), PAIRING_SALT, PBKDF2_ITERATIONS, 256)
         val derived = try {
@@ -106,9 +105,12 @@ class SecureLink(private val context: Context) {
     /** Returns [12-byte IV][AES-GCM encrypted bytes + 16-byte tag]. */
     fun seal(plaintext: ByteArray, aad: ByteArray = byteArrayOf()): ByteArray {
         val key = peerKey ?: error("Enter a pairing phrase before sending")
-        val iv = ByteArray(IV_LENGTH).also(random::nextBytes)
+        // Never supply an IV while initializing an encryption cipher.
+        // Android Keystore and some providers prohibit caller-provided IVs.
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(TAG_BITS, iv))
+        cipher.init(Cipher.ENCRYPT_MODE, key)
+        val iv = cipher.iv
+        check(iv.size == IV_LENGTH) { "AES-GCM returned an unexpected nonce length" }
         cipher.updateAAD(aad)
         return iv + cipher.doFinal(plaintext)
     }
