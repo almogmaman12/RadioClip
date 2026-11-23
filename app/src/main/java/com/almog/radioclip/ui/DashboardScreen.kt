@@ -83,6 +83,8 @@ fun DashboardScreen(
     onSyncClipboardNow: () -> Unit,
     pairingConfigured: Boolean,
     pairingError: String?,
+    transferError: String?,
+    onClearTransferError: () -> Unit,
     onPairingPhrase: (String) -> Unit,
     onForgetPairing: () -> Unit,
     onConnectPeer: (transportType: TransportType, peerId: String) -> Unit,
@@ -244,6 +246,30 @@ fun DashboardScreen(
                                 "Use 12 or more random characters for sensitive transfers.",
                             style = MaterialTheme.typography.bodySmall
                         )
+                    }
+                }
+            }
+
+            if (!transferError.isNullOrBlank()) {
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text("Connection or transfer problem",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onErrorContainer)
+                            Text(transferError,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                style = MaterialTheme.typography.bodySmall)
+                            TextButton(onClick = onClearTransferError) { Text("Dismiss") }
+                        }
                     }
                 }
             }
@@ -536,7 +562,7 @@ fun PeerSectionCard(
                                     shape = RoundedCornerShape(6.dp)
                                 ) {
                                     Text(
-                                        "CONNECTED",
+                                        "LINKED",
                                         color = Color(0xFF2E7D32),
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold,
