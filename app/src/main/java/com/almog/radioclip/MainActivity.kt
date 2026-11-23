@@ -210,6 +210,8 @@ class MainActivity : ComponentActivity() {
                     currentService?.secureLink?.configured?.collectAsState()?.value ?: false
                 val pairingError =
                     currentService?.pairingError?.collectAsState()?.value
+                val transferError =
+                    currentService?.transferError?.collectAsState()?.value
 
                 DashboardScreen(
                     bleState = bleState,
@@ -225,6 +227,8 @@ class MainActivity : ComponentActivity() {
                     onSyncClipboardNow = { currentService?.syncClipboardNow() },
                     pairingConfigured = pairingConfigured,
                     pairingError = pairingError,
+                    transferError = transferError,
+                    onClearTransferError = { currentService?.clearTransferError() },
                     onPairingPhrase = { currentService?.setPairingPhrase(it) },
                     onForgetPairing = { currentService?.forgetPairingPhrase() },
                     onConnectPeer = { transportType, peerId ->
