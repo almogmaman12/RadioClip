@@ -523,13 +523,25 @@ class RadioSyncService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // This user action brings the activity into focus before clipboard access.
+        val sendClipboardIntent = Intent(this, MainActivity::class.java).apply {
+            action = "ACTION_SYNC_CLIPBOARD_FROM_NOTIFICATION"
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val sendClipboardPendingIntent = PendingIntent.getActivity(
+            this, 2, sendClipboardIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("RadioClip Active")
             .setContentText("P2P BLE & Wi-Fi Direct sync running")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
-            .addAction(R.drawable.ic_launcher_foreground, "Send File", sendFilePendingIntent)
+            .addAction(R.drawable.ic_launcher_foreground, "Send clipboard", sendClipboardPendingIntent)
+            .addAction(R.drawable.ic_launcher_foreground, "Send file", sendFilePendingIntent)
             .build()
     }
 
