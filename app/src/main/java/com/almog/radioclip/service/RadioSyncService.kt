@@ -438,9 +438,12 @@ class RadioSyncService : Service() {
                         lastDeliveredClipboardText = text
                         if (pendingLocalClipboardText == text) pendingLocalClipboardText = null
                         _clipboardSyncStatus.value = "Clipboard delivered to peer"
+                        _transferError.value = null
                     } else {
-                        _clipboardSyncStatus.value = "Not delivered: connect a paired device, then retry"
-                        Log.w(TAG, "Clipboard transfer not delivered: ${result.exceptionOrNull()?.message}")
+                        val reason = result.exceptionOrNull()?.message ?: "Peer did not confirm receipt"
+                        _clipboardSyncStatus.value = "Not delivered: $reason"
+                        _transferError.value = "Clipboard transfer failed: $reason"
+                        Log.w(TAG, "Clipboard transfer not delivered: $reason")
                         break
                     }
                 }
