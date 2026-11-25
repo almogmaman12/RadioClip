@@ -109,6 +109,7 @@ class BleEngine(
     private val connectedPeerAddresses = ConcurrentHashMap<String, String>()
     private var peerCleanupJob: Job? = null
     private val clientMtuMap = ConcurrentHashMap<String, Int>()
+    private val serverMtuMap = ConcurrentHashMap<String, Int>()
     private val sendMutex = Mutex()
 
     private val targetReconnectAddresses = ConcurrentHashMap.newKeySet<String>()
@@ -170,11 +171,12 @@ class BleEngine(
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 serverConnectedDevices[address] = device
-                updateConnectedPeers(address, name, true)
+                // A physical GATT link cannot receive data until its CCCD is enabled.
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 serverConnectedDevices.remove(address)
                 subscribedServerDevices.remove(address)
-                updateConnectedPeers(address, name, false)
+                serverMtuMap.remove(address)
+                updateConnectedPeers(address, name, readyClientAddresses.contains(address))
                 incomingPacketBuffers.remove(address)
                 triggerAutoReconnect(address)
             }
@@ -217,7 +219,9 @@ class BleEngine(
             offset: Int,
             value: ByteArray?
         ) {
-            val valid = descriptor.uuid == CCCD_UUID && !preparedWrite && offset == 0
+            val valid = descriptor.uuid == CCCD_UUID && !preparedWrite && offset == 0 &&
+                (value?.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == true ||
+                    value?.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) == true)
             if (valid && value != null) {
                 if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
                     subscribedServerDevices.add(device.address)
@@ -232,6 +236,10 @@ class BleEngine(
                     offset, null
                 )
             }
+            if (valid) {
+                updateConnectedPeers(device.address, getDeviceDisplayName(device, null),
+                    subscribedServerDevices.contains(device.address) || readyClientAddresses.contains(device.address))
+            }
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
@@ -240,7 +248,7 @@ class BleEngine(
 
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
             Log.d(TAG, "GATT Server MTU changed for ${device.address}: $mtu")
-            clientMtuMap[device.address] = mtu
+            serverMtuMap[device.address] = mtu
         }
     }
 
@@ -298,6 +306,8 @@ class BleEngine(
         pendingClientWrites.clear()
         pendingServerNotifications.clear()
         readyClientAddresses.clear()
+        clientMtuMap.clear()
+        serverMtuMap.clear()
         pendingDeliveryAcks.clear()
         clientOperationLocks.clear()
         serverOperationLocks.clear()
@@ -524,6 +534,7 @@ class BleEngine(
     private fun connectToPeerDevice(device: BluetoothDevice) {
         if (!hasBlePermissions()) return
         val address = device.address
+        if (activeGattClients.containsKey(address) || subscribedServerDevices.contains(address)) return
         _state.value = TransportState.CONNECTING
 
         val gattCallback = object : BluetoothGattCallback() {
@@ -545,7 +556,8 @@ class BleEngine(
                     Log.d(TAG, "Disconnected from GATT Client: $address")
                     activeGattClients.remove(address)
                     readyClientAddresses.remove(address)
-                    updateConnectedPeers(address, name, false)
+                    clientMtuMap.remove(address)
+                    updateConnectedPeers(address, name, subscribedServerDevices.contains(address))
                     try { gatt.close() } catch (e: Exception) { Log.w(TAG, "Gatt close error", e) }
                     triggerAutoReconnect(address)
                 }
@@ -895,7 +907,7 @@ class BleEngine(
         data: ByteArray,
         hash: Int
     ) {
-        val mtu = clientMtuMap[device.address] ?: DEFAULT_MTU
+        val mtu = serverMtuMap[device.address] ?: DEFAULT_MTU
         val chunkSize = (mtu - 11).coerceIn(1, DEFAULT_CHUNK_SIZE)
         val count = ((data.size + chunkSize - 1) / chunkSize).coerceAtLeast(1)
         for (index in 0 until count) {
