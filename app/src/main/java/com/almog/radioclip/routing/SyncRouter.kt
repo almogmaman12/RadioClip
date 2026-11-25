@@ -84,9 +84,18 @@ class SyncRouter(
                     if (bleResult.isSuccess) {
                         Result.success(TransportType.BLE_GATT)
                     } else {
-                        // Fallback to Wi-Fi Direct socket if BLE fails
-                        wifiEngine.send(payload, targetPeerId)
-                            .map { TransportType.WIFI_DIRECT_SOCKET }
+                        // Preserve both failures; the fallback must not hide the BLE cause.
+                        val wifiResult = wifiEngine.send(payload, targetPeerId)
+                        if (wifiResult.isSuccess) {
+                            Result.success(TransportType.WIFI_DIRECT_SOCKET)
+                        } else {
+                            val bleError = bleResult.exceptionOrNull()
+                            val wifiError = wifiResult.exceptionOrNull()
+                            Result.failure(IllegalStateException(
+                                "Bluetooth: ${bleError?.message ?: "unknown error"}; Wi-Fi: ${wifiError?.message ?: "unknown error"}",
+                                bleError
+                            ).apply { wifiError?.let { addSuppressed(it) } })
+                        }
                     }
                 } else {
                     wifiEngine.send(payload, targetPeerId)
