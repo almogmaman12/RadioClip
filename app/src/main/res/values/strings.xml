@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">RadioClip</string>
+    <string name="copy_detection_description">Optional RadioClip background sharing. Detects labeled Copy and Cut clicks, then briefly shows a visible window to read new clipboard text and send it to paired connected devices. Does not read screen contents. Disable in RadioClip or Accessibility settings.</string>
 </resources>

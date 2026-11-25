@@ -215,6 +215,7 @@ class MainActivity : ComponentActivity() {
                 val history = currentService?.history?.collectAsState()?.value ?: emptyList()
                 val clipboardSyncEnabled =
                     currentService?.clipboardSyncEnabled?.collectAsState()?.value ?: false
+                val backgroundSyncEnabled = currentService?.backgroundSyncEnabled?.collectAsState()?.value ?: false
                 val clipboardSyncStatus =
                     currentService?.clipboardSyncStatus?.collectAsState()?.value ?: "Off"
                 val pairingConfigured =
@@ -235,6 +236,8 @@ class MainActivity : ComponentActivity() {
                     clipboardSyncEnabled = clipboardSyncEnabled,
                     clipboardSyncStatus = clipboardSyncStatus,
                     onClipboardSyncChange = { currentService?.setClipboardSyncEnabled(it) },
+                    backgroundSyncEnabled = backgroundSyncEnabled,
+                    onBackgroundSyncChange = { currentService?.setBackgroundSyncEnabled(it) },
                     onSyncClipboardNow = { currentService?.syncClipboardNow() },
                     pairingConfigured = pairingConfigured,
                     pairingError = pairingError,

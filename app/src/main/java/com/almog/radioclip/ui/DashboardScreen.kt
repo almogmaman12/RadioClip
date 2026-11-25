@@ -81,6 +81,8 @@ fun DashboardScreen(
     clipboardSyncEnabled: Boolean,
     clipboardSyncStatus: String,
     onClipboardSyncChange: (Boolean) -> Unit,
+    backgroundSyncEnabled: Boolean,
+    onBackgroundSyncChange: (Boolean) -> Unit,
     onSyncClipboardNow: () -> Unit,
     pairingConfigured: Boolean,
     pairingError: String?,
@@ -385,6 +387,27 @@ fun DashboardScreen(
                             ) MaterialTheme.colorScheme.error
                             else MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Background auto-sync (experimental)", fontWeight = FontWeight.SemiBold)
+                                Text("Detects explicit Copy / Cut actions. Briefly displays a focused RadioClip window. Requires Accessibility, overlay and notifications.", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Switch(checked = backgroundSyncEnabled, onCheckedChange = onBackgroundSyncChange, enabled = pairingConfigured)
+                        }
+                        if (backgroundSyncEnabled) {
+                            TextButton(onClick = {
+                                context.startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            }) { Text("Enable RadioClip copy detection") }
+                            TextButton(onClick = {
+                                context.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:" + context.packageName)))
+                            }) { Text("Allow display over other apps") }
+                            TextButton(onClick = {
+                                context.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName))
+                            }) { Text("Check notification permission") }
+                        }
                         OutlinedButton(
                             enabled = pairingConfigured,
                             onClick = onSyncClipboardNow
@@ -394,7 +417,7 @@ fun DashboardScreen(
                         Text(
                             "Copy text in another app, return to RadioClip, then tap " +
                                 "Send current clipboard. Auto-sync only works while this app " +
-                                "has focus. For instant sending use Share → RadioClip.",
+                                "has focus unless experimental background mode works on your device. For instant sending use Share → RadioClip.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

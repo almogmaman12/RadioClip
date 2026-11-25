@@ -125,6 +125,37 @@ class RadioSyncService : Service() {
     private val _clipboardSyncEnabled = MutableStateFlow(false)
     val clipboardSyncEnabled: StateFlow<Boolean> = _clipboardSyncEnabled.asStateFlow()
 
+    private val _backgroundSyncEnabled = MutableStateFlow(false)
+    val backgroundSyncEnabled: StateFlow<Boolean> = _backgroundSyncEnabled.asStateFlow()
+
+    fun setBackgroundSyncEnabled(enabled: Boolean) {
+        _backgroundSyncEnabled.value = enabled
+        getSharedPreferences("radioclip", MODE_PRIVATE).edit()
+            .putBoolean("background_sync_enabled", enabled).apply()
+        if (enabled && !_clipboardSyncEnabled.value) setClipboardSyncEnabled(true)
+        if (transportsStarted) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.notify(NOTIFICATION_ID, createNotification())
+        }
+        if (!windowFocused && _clipboardSyncEnabled.value) {
+            _clipboardSyncStatus.value = if (enabled) "Experimental copy detection enabled" else
+                "Paused: Android blocks background clipboard reads"
+        }
+    }
+
+    fun canInspectBackgroundClipboard(): Boolean =
+        _backgroundSyncEnabled.value && _clipboardSyncEnabled.value &&
+            secureLink.configured.value && !windowFocused &&
+            (bleEngine.connectedPeers.value.isNotEmpty() || wifiEngine.connectedPeers.value.isNotEmpty()) &&
+            androidx.core.app.NotificationManagerCompat.from(this).areNotificationsEnabled() &&
+            android.provider.Settings.canDrawOverlays(this)
+
+    /** Invoked only from the visible, opt-in copy-action window while focused. */
+    fun inspectBackgroundClipboard(minimumTimestamp: Long): Boolean {
+        if (!canInspectBackgroundClipboard()) return true
+        return inspectFocusedClipboard(minimumTimestamp)
+    }
+
     private val _clipboardSyncStatus = MutableStateFlow("Off")
     val clipboardSyncStatus: StateFlow<String> = _clipboardSyncStatus.asStateFlow()
 
@@ -147,6 +178,7 @@ class RadioSyncService : Service() {
             .putBoolean("clipboard_sync_enabled", enabled).apply()
 
         if (!enabled) {
+            if (_backgroundSyncEnabled.value) setBackgroundSyncEnabled(false)
             pendingLocalClipboardText = null
             _clipboardSyncStatus.value = "Off"
         } else {
@@ -176,7 +208,8 @@ class RadioSyncService : Service() {
                 inspectFocusedClipboard()
                 flushPendingClipboard()
             } else {
-                _clipboardSyncStatus.value = "Paused: Android blocks background clipboard reads"
+                _clipboardSyncStatus.value = if (_backgroundSyncEnabled.value) "Experimental copy detection enabled" else
+                    "Paused: Android blocks background clipboard reads"
             }
         }
     }
@@ -240,6 +273,8 @@ class RadioSyncService : Service() {
         activeInstance = this
         _clipboardSyncEnabled.value = getSharedPreferences("radioclip", MODE_PRIVATE)
             .getBoolean("clipboard_sync_enabled", false)
+        _backgroundSyncEnabled.value = _clipboardSyncEnabled.value && getSharedPreferences("radioclip", MODE_PRIVATE)
+            .getBoolean("background_sync_enabled", false)
         createNotificationChannel()
 
         secureLink = SecureLink(applicationContext)
@@ -250,7 +285,8 @@ class RadioSyncService : Service() {
 
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
         _clipboardSyncStatus.value = if (_clipboardSyncEnabled.value) {
-            "Paused: Android blocks background clipboard reads"
+            if (_backgroundSyncEnabled.value) "Experimental copy detection enabled" else
+                "Paused: Android blocks background clipboard reads"
         } else "Off"
 
         // A copied item that failed while disconnected is kept for retry when a
@@ -382,39 +418,45 @@ class RadioSyncService : Service() {
         return START_STICKY
     }
 
-    /** Only reads plain text while the RadioClip UI has input focus. */
-    private fun inspectFocusedClipboard() {
-        if (!windowFocused || !_clipboardSyncEnabled.value || !secureLink.configured.value) return
-        val manager = clipboardManager ?: return
+    /** Foreground reads, or fresh reads from the opt-in visible copy-action window. */
+    private fun inspectFocusedClipboard(minimumTimestamp: Long? = null): Boolean {
+        if (!_clipboardSyncEnabled.value || !secureLink.configured.value) return true
+        if (minimumTimestamp == null && !windowFocused) return true
+        val manager = clipboardManager ?: return true
         try {
-            val clip = manager.primaryClip ?: return
-            val description = clip.description
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE) == true
-            ) {
+            val description = manager.primaryClipDescription ?: return false
+            if (minimumTimestamp != null && description.timestamp < minimumTimestamp) return false
+            if (description.extras?.getBoolean("android.content.extra.IS_SENSITIVE") == true) {
                 _clipboardSyncStatus.value = "Sensitive clipboard skipped"
-                return
+                return true
             }
             if (!description.hasMimeType(ClipDescription.MIMETYPE_TEXT_PLAIN) &&
-                !description.hasMimeType(ClipDescription.MIMETYPE_TEXT_HTML)
-            ) return
-            if (clip.itemCount == 0) return
-            val text = clip.getItemAt(0).text?.toString() ?: return
+                !description.hasMimeType(ClipDescription.MIMETYPE_TEXT_HTML)) return true
+            val clip = manager.primaryClip ?: return false
+            if (minimumTimestamp != null && clip.description.timestamp < minimumTimestamp) return false
+            if (clip.description.extras?.getBoolean("android.content.extra.IS_SENSITIVE") == true) return true
+            if (clip.itemCount == 0) return true
+            val text = clip.getItemAt(0).text?.toString() ?: return true
+            if (minimumTimestamp != null && text.trim().matches(Regex("[0-9]{4,8}"))) {
+                _clipboardSyncStatus.value = "Possible verification code skipped"
+                return true
+            }
             if (text.isBlank() || text == lastDeliveredClipboardText ||
-                text == lastRemoteClipboardText || text == pendingLocalClipboardText
-            ) return
+                text == lastRemoteClipboardText || text == pendingLocalClipboardText) return true
             if (text.toByteArray(Charsets.UTF_8).size > 1024 * 1024) {
                 _clipboardSyncStatus.value = "Clipboard text exceeds 1 MB; use file sharing"
-                return
+                return true
             }
             pendingLocalClipboardText = text
             flushPendingClipboard()
+            return true
         } catch (e: SecurityException) {
             _clipboardSyncStatus.value = "Clipboard access denied by Android"
         } catch (e: Exception) {
             Log.w(TAG, "Could not inspect clipboard", e)
             _clipboardSyncStatus.value = "Unable to read clipboard"
         }
+        return false
     }
 
     /** Transport completion must be confirmed before a copy is considered synced. */
@@ -539,7 +581,7 @@ class RadioSyncService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("RadioClip Active")
-            .setContentText("P2P BLE & Wi-Fi Direct sync running")
+            .setContentText(if (_backgroundSyncEnabled.value) "Experimental automatic clipboard sharing is on" else "P2P BLE & Wi-Fi Direct sync running")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
