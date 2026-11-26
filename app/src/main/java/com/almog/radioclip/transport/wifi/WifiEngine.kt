@@ -12,8 +12,11 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pDeviceList
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest
 import android.os.Build
 import android.util.Log
+import com.almog.radioclip.security.SecureLink
 import com.almog.radioclip.model.Payload
 import com.almog.radioclip.model.PeerDevice
 import com.almog.radioclip.model.TransportState
@@ -33,6 +36,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
+import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.InputStream
@@ -40,13 +44,18 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.UUID
 import kotlin.coroutines.resume
-import kotlin.coroutines.suspendCoroutine
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 @SuppressLint("MissingPermission")
 class WifiEngine(
     private val context: Context,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job())
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job()),
+    private val secureLink: SecureLink
 ) : DeviceTransport {
 
     companion object {
@@ -55,8 +64,14 @@ class WifiEngine(
         private const val SOCKET_TIMEOUT_MS = 10000
 
         // Stream wire protocol tags
+        private const val TYPE_HELLO: Byte = 0
         private const val TYPE_TEXT: Byte = 1
         private const val TYPE_FILE: Byte = 2
+        private const val ACK_SUCCESS = 1
+        private const val FILE_CHUNK = 64 * 1024
+        private const val MAX_TEXT_BYTES = 1024 * 1024
+        private const val CRYPTO_OVERHEAD = 28
+        private const val PEER_EXPIRY_MS = 90_000L
     }
 
     override val transportType: TransportType = TransportType.WIFI_DIRECT_SOCKET
@@ -91,6 +106,15 @@ class WifiEngine(
 
     private val connectedClientIps = ConcurrentHashMap.newKeySet<String>()
     private val discoveredDevices = ConcurrentHashMap<String, WifiP2pDevice>()
+    // Only devices advertising the RadioClip DNS-SD service are displayable.
+    private val radioClipSeenAt = ConcurrentHashMap<String, Long>()
+    private var localRadioClipService: WifiP2pDnsSdServiceInfo? = null
+    private var radioClipServiceRequest: WifiP2pDnsSdServiceRequest? = null
+    private var discoveryRegistrationInProgress = false
+    private var discoveryRetryJob: Job? = null
+    private val connectMutex = Mutex()
+    private var negotiationTimeoutJob: Job? = null
+    private val deliveredIds = ConcurrentHashMap<String, Long>()
 
     // MAC address of the peer we initiated connect() to, used for UI ID matching
     @Volatile
@@ -107,6 +131,7 @@ class WifiEngine(
                 }
 
                 WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
+                    // General P2P peer results alone DO NOT identify RadioClip devices.
                     requestPeers()
                 }
 
@@ -131,11 +156,10 @@ class WifiEngine(
 
                     if (networkInfo?.isConnected == true || directP2pInfo?.groupFormed == true) {
                         requestConnectionInfo()
-                    } else {
+                    } else if (_state.value != TransportState.CONNECTING) {
+                        closeServerSocket()
                         if (_connectedPeers.value.isNotEmpty()) {
                             _state.value = TransportState.DISCONNECTED
-                        } else if (_state.value == TransportState.CONNECTING) {
-                            _state.value = TransportState.SCANNING
                         }
                         _connectedPeers.value = emptyList()
                         groupOwnerAddress = null
@@ -174,8 +198,8 @@ class WifiEngine(
         }
 
         _state.value = TransportState.SCANNING
-        startPeerDiscovery()
-        startServerSocket()
+        registerRadioClipDiscovery()
+        // Never expose a TCP receiver before a Wi-Fi Direct group exists.
         startConnectionMonitor()
     }
 
@@ -216,6 +240,7 @@ class WifiEngine(
     }
 
     private fun handleGroupDisconnected() {
+        closeServerSocket()
         _state.value = TransportState.DISCONNECTED
         _connectedPeers.value = emptyList()
         groupOwnerAddress = null
@@ -227,6 +252,10 @@ class WifiEngine(
     override suspend fun stop() = withContext(Dispatchers.IO) {
         connectionMonitorJob?.cancel()
         connectionMonitorJob = null
+        discoveryRetryJob?.cancel()
+        discoveryRetryJob = null
+        negotiationTimeoutJob?.cancel()
+        negotiationTimeoutJob = null
 
         if (isReceiverRegistered) {
             try {
@@ -237,16 +266,21 @@ class WifiEngine(
             isReceiverRegistered = false
         }
 
-        serverJob?.cancel()
-        serverSocket?.close()
-        serverSocket = null
+        closeServerSocket()
 
         val p2p = wifiP2pManager
         val ch = channel
         if (p2p != null && ch != null) {
             p2p.stopPeerDiscovery(ch, null)
+            radioClipServiceRequest?.let { p2p.removeServiceRequest(ch, it, null) }
+            localRadioClipService?.let { p2p.removeLocalService(ch, it, null) }
             p2p.removeGroup(ch, null)
         }
+        radioClipServiceRequest = null
+        discoveryRegistrationInProgress = false
+        localRadioClipService = null
+        radioClipSeenAt.clear()
+        discoveredDevices.clear()
 
         _discoveredPeers.value = emptyList()
         _connectedPeers.value = emptyList()
@@ -255,17 +289,126 @@ class WifiEngine(
         _state.value = TransportState.IDLE
     }
 
-    fun startPeerDiscovery() {
+    /**
+     * General discoverPeers() finds TVs, printers, and unrelated phones.
+     * Android's DNS-SD service discovery identifies devices advertising
+     * RadioClip's own protocol before they are offered for connection.
+     */
+    private fun registerRadioClipDiscovery() {
         val p2p = wifiP2pManager ?: return
         val ch = channel ?: return
 
-        p2p.discoverPeers(ch, object : WifiP2pManager.ActionListener {
+        p2p.setDnsSdResponseListeners(
+            ch,
+            WifiP2pManager.DnsSdServiceResponseListener { instance, serviceType, device ->
+                if (RadioClipServiceIdentity.matchesService(instance, serviceType)) {
+                    markRadioClipPeer(device)
+                }
+            },
+            WifiP2pManager.DnsSdTxtRecordListener { domain, record, device ->
+                if (RadioClipServiceIdentity.matchesRecord(domain, record)) {
+                    markRadioClipPeer(device)
+                }
+            }
+        )
+
+        val service = WifiP2pDnsSdServiceInfo.newInstance(
+            RadioClipServiceIdentity.INSTANCE,
+            RadioClipServiceIdentity.TYPE,
+            mapOf("protocol" to RadioClipServiceIdentity.PROTOCOL, "port" to PORT.toString())
+        )
+        localRadioClipService = service
+        p2p.addLocalService(ch, service, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                Log.d(TAG, "Wi-Fi Direct peer discovery started successfully")
+                Log.d(TAG, "RadioClip DNS-SD service advertised")
+                startPeerDiscovery()
             }
 
             override fun onFailure(reason: Int) {
-                Log.e(TAG, "Wi-Fi Direct peer discovery failed: $reason")
+                Log.e(TAG, "Could not advertise RadioClip DNS-SD service: $reason")
+                // The P2P engine isn't ready to find other RadioClip devices.
+                _state.value = TransportState.ERROR
+            }
+        })
+
+        // Android can stop discovering after radio power or group changes.
+        discoveryRetryJob?.cancel()
+        discoveryRetryJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(30_000L)
+                if (_state.value == TransportState.SCANNING ||
+                    _state.value == TransportState.DISCONNECTED
+                ) {
+                    startPeerDiscovery()
+                }
+            }
+        }
+    }
+
+    private fun markRadioClipPeer(device: WifiP2pDevice) {
+        if (_state.value == TransportState.IDLE) return
+        val address = device.deviceAddress ?: return
+        if (address.isBlank()) return
+        radioClipSeenAt[address] = System.currentTimeMillis()
+        discoveredDevices[address] = device
+        refreshVerifiedPeerList()
+    }
+
+    private fun refreshVerifiedPeerList() {
+        val now = System.currentTimeMillis()
+        radioClipSeenAt.entries.removeIf { now - it.value > PEER_EXPIRY_MS }
+        _discoveredPeers.value = radioClipSeenAt.keys.mapNotNull { address ->
+            val device = discoveredDevices[address] ?: return@mapNotNull null
+            PeerDevice(
+                id = address,
+                name = device.deviceName?.takeIf { it.isNotBlank() }
+                    ?: "RadioClip (${address.takeLast(5)})",
+                transportType = TransportType.WIFI_DIRECT_SOCKET,
+                isConnected = _connectedPeers.value.any { it.id == address }
+            )
+        }.sortedBy { it.name }
+    }
+
+    fun startPeerDiscovery() {
+        val p2p = wifiP2pManager ?: return
+        val ch = channel ?: return
+        if (_state.value == TransportState.IDLE ||
+            _state.value == TransportState.CONNECTING || _state.value == TransportState.CONNECTED) return
+
+        if (radioClipServiceRequest == null) {
+            if (discoveryRegistrationInProgress) return
+            discoveryRegistrationInProgress = true
+            val request = WifiP2pDnsSdServiceRequest.newInstance(RadioClipServiceIdentity.TYPE)
+            p2p.addServiceRequest(ch, request, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    discoveryRegistrationInProgress = false
+                    radioClipServiceRequest = request
+                    searchRadioClipServices()
+                }
+
+                override fun onFailure(reason: Int) {
+                    discoveryRegistrationInProgress = false
+                    Log.w(TAG, "Could not register RadioClip service search: $reason")
+                }
+            })
+        } else {
+            searchRadioClipServices()
+        }
+    }
+
+    private fun searchRadioClipServices() {
+        if (_state.value == TransportState.IDLE ||
+            _state.value == TransportState.CONNECTING || _state.value == TransportState.CONNECTED) return
+        val p2p = wifiP2pManager ?: return
+        val ch = channel ?: return
+        refreshVerifiedPeerList()
+        p2p.discoverServices(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(TAG, "Searching only for RadioClip DNS-SD services")
+            }
+
+            override fun onFailure(reason: Int) {
+                Log.w(TAG, "RadioClip service discovery failed: $reason")
             }
         })
     }
@@ -273,90 +416,104 @@ class WifiEngine(
     private fun requestPeers() {
         val p2p = wifiP2pManager ?: return
         val ch = channel ?: return
-
         p2p.requestPeers(ch) { peers: WifiP2pDeviceList? ->
-            val list = mutableListOf<PeerDevice>()
+            // Refresh metadata solely for peers already identified by DNS-SD.
             peers?.deviceList?.forEach { device ->
-                if (!isExcludedDevice(device)) {
+                if (radioClipSeenAt.containsKey(device.deviceAddress)) {
                     discoveredDevices[device.deviceAddress] = device
-                    list.add(
-                        PeerDevice(
-                            id = device.deviceAddress,
-                            name = device.deviceName?.takeIf { it.isNotBlank() } ?: "Android (${device.deviceAddress.takeLast(5)})",
-                            transportType = TransportType.WIFI_DIRECT_SOCKET,
-                            isConnected = device.status == WifiP2pDevice.CONNECTED
-                        )
-                    )
                 }
             }
-            _discoveredPeers.value = list
-            Log.d(TAG, "Discovered ${list.size} eligible Wi-Fi Direct peers")
+            refreshVerifiedPeerList()
         }
     }
 
-    private fun isExcludedDevice(device: WifiP2pDevice): Boolean {
-        val name = device.deviceName?.lowercase() ?: ""
-        val primaryType = device.primaryDeviceType?.lowercase() ?: ""
-
-        val excludedKeywords = listOf("tv", "bravia", "samsung", "lg webos", "roku", "printer", "chromecast", "display", "fridge")
-        if (excludedKeywords.any { name.contains(it) }) return true
-
-        if (primaryType.startsWith("7-") || primaryType.startsWith("3-") || primaryType.startsWith("8-")) {
-            return true
-        }
-
-        return false
-    }
-
-    override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.IO) {
-        suspendCoroutine { cont ->
-            val p2p = wifiP2pManager
-            val ch = channel
-            if (p2p == null || ch == null) {
-                cont.resume(Result.failure(IllegalStateException("WifiP2pManager not initialized")))
-                return@suspendCoroutine
-            }
-
-            _state.value = TransportState.CONNECTING
-            pendingConnectMac = peerId // Track MAC address for UI peer ID matching
-
-            // Cancel discovery first to let Android Wi-Fi Direct negotiate the P2P group
-            p2p.stopPeerDiscovery(ch, object : WifiP2pManager.ActionListener {
+    // Serialize requests and wait for Android's asynchronous action callbacks.
+    private suspend fun p2pAction(
+        action: (WifiP2pManager.ActionListener) -> Unit
+    ): Int? = withTimeoutOrNull(5000L) {
+        suspendCancellableCoroutine<Int> { cont ->
+            action(object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
-                    initiateGroupConnect(p2p, ch, peerId, cont)
+                    if (cont.isActive) cont.resume(-1)
                 }
 
                 override fun onFailure(reason: Int) {
-                    initiateGroupConnect(p2p, ch, peerId, cont)
+                    if (cont.isActive) cont.resume(reason)
                 }
             })
         }
     }
 
-    private fun initiateGroupConnect(
-        p2p: WifiP2pManager,
-        ch: WifiP2pManager.Channel,
-        peerId: String,
-        cont: kotlin.coroutines.Continuation<Result<Unit>>
-    ) {
-        val config = WifiP2pConfig().apply {
-            this.deviceAddress = peerId
-            // Use standard PBC (Push Button Configuration) for peer-to-peer pairing without PIN
-            wps.setup = android.net.wifi.WpsInfo.PBC
+    override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.Main) {
+        connectMutex.withLock {
+            val p2p = wifiP2pManager
+            val ch = channel
+            if (p2p == null || ch == null) {
+                return@withLock Result.failure<Unit>(IllegalStateException("WifiP2pManager not initialized"))
+            }
+            if (_state.value == TransportState.CONNECTING || _state.value == TransportState.CONNECTED) {
+                return@withLock Result.failure<Unit>(IllegalStateException("Wi-Fi Direct is already connecting or connected"))
+            }
+            if (!radioClipSeenAt.containsKey(peerId)) {
+                return@withLock Result.failure<Unit>(IllegalArgumentException("This device is not advertising RadioClip"))
+            }
+
+            _state.value = TransportState.CONNECTING
+            pendingConnectMac = peerId
+            val config = WifiP2pConfig().apply {
+                deviceAddress = peerId
+                wps.setup = android.net.wifi.WpsInfo.PBC
+            }
+
+            var failure = "Wi-Fi Direct connection timed out"
+            var accepted = false
+            try {
+                for (attempt in 0 until 4) {
+                    if (_state.value != TransportState.CONNECTING) break
+                    val stopped = p2pAction { p2p.stopPeerDiscovery(ch, it) }
+                    if (stopped != -1) {
+                        failure = "Wi-Fi Direct could not stop discovery (code: ${stopped ?: "timeout"})"
+                        if (stopped != WifiP2pManager.BUSY && stopped != null) break
+                        delay(500L * (attempt + 1))
+                        continue
+                    }
+                    // Allow the framework's discovery-to-negotiation transition to settle.
+                    delay(300L)
+                    if (_state.value != TransportState.CONNECTING) break
+                    val reason = p2pAction { p2p.connect(ch, config, it) }
+                    if (reason == -1) {
+                        accepted = true
+                        negotiationTimeoutJob?.cancel()
+                        negotiationTimeoutJob = scope.launch(Dispatchers.Main) {
+                            delay(35_000L)
+                            if (_state.value == TransportState.CONNECTING && pendingConnectMac == peerId) {
+                                p2pAction { p2p.cancelConnect(ch, it) }
+                                if (_state.value == TransportState.CONNECTING) {
+                                    pendingConnectMac = null
+                                    _state.value = TransportState.SCANNING
+                                    startPeerDiscovery()
+                                }
+                            }
+                        }
+                        return@withLock Result.success(Unit)
+                    }
+                    failure = if (reason == WifiP2pManager.BUSY) {
+                        "Wi-Fi Direct is busy after retrying. Try connecting again."
+                    } else {
+                        "Wi-Fi Direct connect failed (code: ${reason ?: "timeout"})"
+                    }
+                    if (reason != WifiP2pManager.BUSY) break
+                    delay(600L * (attempt + 1))
+                }
+                Result.failure<Unit>(IllegalStateException(failure))
+            } finally {
+                if (!accepted && _state.value == TransportState.CONNECTING) {
+                    pendingConnectMac = null
+                    _state.value = TransportState.SCANNING
+                    startPeerDiscovery()
+                }
+            }
         }
-
-        p2p.connect(ch, config, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Log.d(TAG, "Wi-Fi Direct connect initiation to $peerId succeeded")
-                cont.resume(Result.success(Unit))
-            }
-
-            override fun onFailure(reason: Int) {
-                Log.e(TAG, "Wi-Fi Direct connect initiation to $peerId failed: $reason")
-                _state.value = TransportState.SCANNING
-                cont.resume(Result.failure(Exception("Wi-Fi Direct connect failed code: $reason")))
-            }
-        })
     }
 
     private fun requestConnectionInfo() {
@@ -370,6 +527,8 @@ class WifiEngine(
     }
 
     private fun handleGroupFormed(info: WifiP2pInfo) {
+        negotiationTimeoutJob?.cancel()
+        negotiationTimeoutJob = null
         isGroupOwner = info.isGroupOwner
         val goAddress = info.groupOwnerAddress?.hostAddress
         groupOwnerAddress = goAddress
@@ -379,37 +538,23 @@ class WifiEngine(
         val peers = mutableListOf<PeerDevice>()
         val connectedMac = pendingConnectMac
 
-        if (!isGroupOwner && connectedMac != null) {
-            val device = discoveredDevices[connectedMac]
-            val peerName = device?.deviceName?.takeIf { it.isNotBlank() }
-                ?: "Wi-Fi Direct GO ($goAddress)"
-            peers.add(PeerDevice(
-                id = connectedMac,
-                name = peerName,
-                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                isConnected = true
-            ))
-            val existing = _discoveredPeers.value.toMutableList()
-            val idx = existing.indexOfFirst { it.id == connectedMac }
-            if (idx < 0) {
-                existing.add(PeerDevice(id = connectedMac, name = peerName,
-                    transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
-            } else {
-                existing[idx] = existing[idx].copy(isConnected = true)
-            }
-            _discoveredPeers.value = existing
-            sendHelloToGroupOwner(goAddress)
-        } else if (isGroupOwner) {
-            peers.add(PeerDevice(
-                id = goAddress ?: "p2p_group",
-                name = "Group Owner (GO: $goAddress)",
-                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                isConnected = true
-            ))
+        if (isGroupOwner) {
+            // A group can form before another RadioClip peer has authenticated.
+            // Only peers that complete the encrypted hello enter the list.
             connectedClientIps.forEach { clientIp ->
-                peers.add(PeerDevice(id = clientIp, name = "Client ($clientIp)",
-                    transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
+                peers.add(
+                    PeerDevice(
+                        id = clientIp,
+                        name = "RadioClip peer ($clientIp)",
+                        transportType = TransportType.WIFI_DIRECT_SOCKET,
+                        isConnected = true
+                    )
+                )
             }
+        } else {
+            // The group owner's Wi-Fi identity alone does not prove it has RadioClip.
+            // sendHelloToGroupOwner() adds it only after an authenticated response.
+            sendHelloToGroupOwner(goAddress)
         }
 
         _connectedPeers.value = peers
@@ -421,29 +566,55 @@ class WifiEngine(
      * This causes the GO's ServerSocket to accept the connection and register our IP address,
      * which the GO needs to send data back to this client device.
      */
+    fun onPairingChanged() {
+        // Invalidate all previous authentication when the group phrase changes.
+        connectedClientIps.clear()
+        _connectedPeers.value = emptyList()
+        refreshVerifiedPeerList()
+        if (!isGroupOwner && _state.value == TransportState.CONNECTED) {
+            sendHelloToGroupOwner(groupOwnerAddress)
+        }
+    }
+
     private fun sendHelloToGroupOwner(goAddress: String?) {
-        if (goAddress.isNullOrBlank()) return
+        if (goAddress.isNullOrBlank() || !secureLink.configured.value) return
         scope.launch(Dispatchers.IO) {
+            delay(1500)
             try {
-                delay(1500) // Brief wait for DHCP/routing to be fully ready
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress(goAddress, PORT), SOCKET_TIMEOUT_MS)
-                    val output = DataOutputStream(socket.getOutputStream())
-                    // Send a TYPE_TEXT hello so GO's protocol parser can handle it cleanly
-                    output.writeByte(TYPE_TEXT.toInt())
-                    output.writeUTF("__radioclip_hello__")
-                    output.writeLong(System.currentTimeMillis())
-                    output.writeUTF("__peer_hello__")
-                    output.flush()
+                sendOnce(goAddress, null)
+                val peerId = pendingConnectMac
+                if (peerId != null && radioClipSeenAt.containsKey(peerId)) {
+                    val device = discoveredDevices[peerId]
+                    _connectedPeers.value = listOf(
+                        PeerDevice(
+                            id = peerId,
+                            name = device?.deviceName?.takeIf { it.isNotBlank() }
+                                ?: "RadioClip peer",
+                            transportType = TransportType.WIFI_DIRECT_SOCKET,
+                            isConnected = true
+                        )
+                    )
+                    refreshVerifiedPeerList()
                 }
-                Log.d(TAG, "Peer hello sent to Group Owner: $goAddress")
             } catch (e: Exception) {
-                Log.w(TAG, "Peer hello to GO failed (non-critical): ${e.message}")
+                Log.w(TAG, "Authenticated Wi-Fi Direct peer registration failed", e)
             }
         }
     }
 
+    private fun closeServerSocket() {
+        serverJob?.cancel()
+        try {
+            serverSocket?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not close Wi-Fi receiver socket", e)
+        }
+        serverSocket = null
+        serverJob = null
+    }
+
     private fun startServerSocket() {
+        if (groupOwnerAddress == null || _state.value != TransportState.CONNECTED) return
         if (serverSocket != null && serverSocket?.isClosed == false) return
 
         serverJob?.cancel()
@@ -456,10 +627,10 @@ class WifiEngine(
 
                 while (isActive) {
                     val socket = serverSocket?.accept() ?: break
-                    val clientIp = socket.inetAddress?.hostAddress
-                    if (clientIp != null && isGroupOwner) {
-                        connectedClientIps.add(clientIp)
-                        updateConnectedPeersList()
+                    socket.soTimeout = SOCKET_TIMEOUT_MS
+                    if (_state.value != TransportState.CONNECTED || groupOwnerAddress == null) {
+                        socket.close()
+                        continue
                     }
                     launch(Dispatchers.IO) {
                         handleIncomingConnection(socket)
@@ -474,17 +645,21 @@ class WifiEngine(
     }
 
     private fun updateConnectedPeersList() {
-        val goAddress = groupOwnerAddress ?: "p2p_group"
-        val goId = if (isGroupOwner) goAddress else (pendingConnectMac ?: goAddress)
-        val ownerLabel = if (isGroupOwner) "Group Owner (GO: $goAddress)" else "Connected (GO: $goAddress)"
-        val list = mutableListOf(
-            PeerDevice(
-                id = goId,
-                name = ownerLabel,
-                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                isConnected = true
-            )
-        )
+        // Group Owner is this phone, not another discovered RadioClip peer.
+        val list = mutableListOf<PeerDevice>()
+        if (!isGroupOwner) {
+            val address = pendingConnectMac
+            if (address != null && radioClipSeenAt.containsKey(address)) {
+                list.add(
+                    PeerDevice(
+                        id = address,
+                        name = discoveredDevices[address]?.deviceName ?: "RadioClip peer",
+                        transportType = TransportType.WIFI_DIRECT_SOCKET,
+                        isConnected = true
+                    )
+                )
+            }
+        }
         connectedClientIps.forEach { clientIp ->
             list.add(PeerDevice(
                 id = clientIp,
@@ -495,155 +670,284 @@ class WifiEngine(
         }
         _connectedPeers.value = list
 
-        // For GO: also add clients into discoveredPeers so they show in the UI list
-        if (isGroupOwner && connectedClientIps.isNotEmpty()) {
-            val existing = _discoveredPeers.value.toMutableList()
-            connectedClientIps.forEach { clientIp ->
-                if (existing.none { it.id == clientIp }) {
-                    existing.add(PeerDevice(id = clientIp, name = "Client ($clientIp)",
-                        transportType = TransportType.WIFI_DIRECT_SOCKET, isConnected = true))
-                }
-            }
-            _discoveredPeers.value = existing
+        // For GO: these IPs have sent a valid encrypted hello.
+        // Do not place group-owner placeholders in the nearby-device list.
+        // Connected RadioClip peers are merged into the dashboard separately.
+    }
+
+    private fun authenticationData(
+        type: Byte,
+        id: String,
+        timestamp: Long,
+        fileName: String = "",
+        mimeType: String = "",
+        fileSize: Long = 0,
+        chunkIndex: Int = 0
+    ): ByteArray = ByteArrayOutputStream().use { bytes ->
+        DataOutputStream(bytes).use { out ->
+            out.writeByte(2) // RadioClip protocol version
+            out.writeByte(type.toInt())
+            out.writeUTF(id)
+            out.writeLong(timestamp)
+            out.writeUTF(fileName)
+            out.writeUTF(mimeType)
+            out.writeLong(fileSize)
+            out.writeInt(chunkIndex)
         }
+        bytes.toByteArray()
+    }
+
+    private fun registerAuthenticatedClient(address: String?) {
+        if (isGroupOwner && !address.isNullOrBlank() && connectedClientIps.add(address)) {
+            updateConnectedPeersList()
+        }
+    }
+
+    private fun rememberDelivery(id: String): Boolean {
+        val now = System.currentTimeMillis()
+        deliveredIds.entries.removeIf { now - it.value > 10 * 60_000L }
+        return deliveredIds.putIfAbsent(id, now) == null
     }
 
     private suspend fun handleIncomingConnection(socket: Socket) = withContext(Dispatchers.IO) {
         socket.use { s ->
             try {
                 val input = DataInputStream(s.getInputStream())
+                val output = DataOutputStream(s.getOutputStream())
                 val wireType = input.readByte()
                 val payloadId = input.readUTF()
                 val timestamp = input.readLong()
-
                 val clientIp = s.inetAddress?.hostAddress
-                val resolvedSenderName = when {
-                    !isGroupOwner -> {
-                        val mac = pendingConnectMac
-                        val dev = if (mac != null) discoveredDevices[mac] else null
-                        dev?.deviceName?.takeIf { it.isNotBlank() } ?: "Group Owner ($clientIp)"
-                    }
-                    else -> {
-                        // We are Group Owner, find matching client device by looking at discovered devices
-                        val matchingDevice = discoveredDevices.values.firstOrNull { it.status == WifiP2pDevice.CONNECTED }
-                        matchingDevice?.deviceName?.takeIf { it.isNotBlank() } ?: "Client ($clientIp)"
-                    }
+                val resolvedSenderName = if (!isGroupOwner) {
+                    val device = pendingConnectMac?.let { discoveredDevices[it] }
+                    device?.deviceName?.takeIf { it.isNotBlank() } ?: "Group Owner"
+                } else {
+                    "Paired Wi-Fi Direct peer"
                 }
 
                 when (wireType) {
-                    TYPE_TEXT -> {
-                        val text = input.readUTF()
-                        if (text == "__peer_hello__") {
-                            // Client sent a hello to register its IP on the GO's ServerSocket
-                            Log.d(TAG, "Received peer hello from $clientIp — IP registered")
-                            return@use // IP already captured via ServerSocket.accept()
-                        }
-                        _incomingPayloads.emit(
-                            Payload.Text(
-                                id = payloadId,
-                                timestamp = timestamp,
-                                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                                senderDeviceName = resolvedSenderName,
-                                isOutgoing = false,
-                                content = text
-                            )
+                    TYPE_HELLO -> {
+                        val length = input.readInt()
+                        require(length in CRYPTO_OVERHEAD..256) { "Invalid pairing hello" }
+                        val packet = ByteArray(length)
+                        input.readFully(packet)
+                        val message = secureLink.open(
+                            packet, authenticationData(wireType, payloadId, timestamp)
                         )
-                        Log.d(TAG, "Received Text via Wi-Fi socket from $resolvedSenderName: ${text.take(30)}")
+                        require(message.contentEquals("RadioClip hello v2".toByteArray(Charsets.UTF_8))) {
+                            "Unrecognized pairing hello"
+                        }
+                        registerAuthenticatedClient(clientIp)
+                    }
+
+                    TYPE_TEXT -> {
+                        val length = input.readInt()
+                        require(length in CRYPTO_OVERHEAD..(MAX_TEXT_BYTES + CRYPTO_OVERHEAD)) {
+                            "Invalid encrypted message size"
+                        }
+                        val packet = ByteArray(length)
+                        input.readFully(packet)
+                        val plain = secureLink.open(
+                            packet, authenticationData(wireType, payloadId, timestamp)
+                        )
+                        require(plain.size <= MAX_TEXT_BYTES) { "Text is too large" }
+                        registerAuthenticatedClient(clientIp)
+                        if (rememberDelivery(payloadId)) {
+                            _incomingPayloads.emit(
+                                Payload.Text(
+                                    id = payloadId,
+                                    timestamp = timestamp,
+                                    transportType = TransportType.WIFI_DIRECT_SOCKET,
+                                    senderDeviceName = resolvedSenderName,
+                                    isOutgoing = false,
+                                    content = String(plain, Charsets.UTF_8)
+                                )
+                            )
+                        }
                     }
 
                     TYPE_FILE -> {
                         val fileName = input.readUTF()
                         val mimeType = input.readUTF()
                         val fileSize = input.readLong()
-
-                        val receivedDir = File(context.cacheDir, "received_files").apply { mkdirs() }
-                        val targetFile = File(receivedDir, fileName)
-
-                        targetFile.outputStream().use { out ->
-                            val buffer = ByteArray(64 * 1024)
-                            var remaining = fileSize
-                            while (remaining > 0) {
-                                val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-                                if (read == -1) break
-                                out.write(buffer, 0, read)
-                                remaining -= read
+                        FileTransferSafety.checkSize(fileSize)
+                        val safeName = FileTransferSafety.safeName(fileName)
+                        val directory = File(context.filesDir, "received_files").apply { mkdirs() }
+                        val target = File(directory, "${UUID.randomUUID()}-$safeName")
+                        try {
+                            target.outputStream().use { stream ->
+                                var remaining = fileSize
+                                var chunkIndex = 0
+                                do {
+                                    val expectedPlain = minOf(remaining, FILE_CHUNK.toLong()).toInt()
+                                    val expectedSealed = expectedPlain + CRYPTO_OVERHEAD
+                                    val sealedSize = input.readInt()
+                                    require(sealedSize == expectedSealed) { "Invalid encrypted file chunk" }
+                                    val sealed = ByteArray(sealedSize)
+                                    input.readFully(sealed)
+                                    val plain = secureLink.open(
+                                        sealed,
+                                        authenticationData(
+                                            wireType, payloadId, timestamp,
+                                            fileName, mimeType, fileSize, chunkIndex
+                                        )
+                                    )
+                                    require(plain.size == expectedPlain) { "File chunk size mismatch" }
+                                    stream.write(plain)
+                                    remaining -= plain.size
+                                    chunkIndex++
+                                } while (remaining > 0)
                             }
+                        } catch (e: Exception) {
+                            target.delete()
+                            throw e
                         }
-
-                        _incomingPayloads.emit(
-                            Payload.File(
-                                id = payloadId,
-                                timestamp = timestamp,
-                                transportType = TransportType.WIFI_DIRECT_SOCKET,
-                                senderDeviceName = resolvedSenderName,
-                                isOutgoing = false,
-                                fileName = fileName,
-                                mimeType = mimeType,
-                                sizeBytes = fileSize,
-                                localPath = targetFile.absolutePath
+                        registerAuthenticatedClient(clientIp)
+                        if (rememberDelivery(payloadId)) {
+                            _incomingPayloads.emit(
+                                Payload.File(
+                                    id = payloadId,
+                                    timestamp = timestamp,
+                                    transportType = TransportType.WIFI_DIRECT_SOCKET,
+                                    senderDeviceName = resolvedSenderName,
+                                    isOutgoing = false,
+                                    fileName = safeName,
+                                    mimeType = mimeType,
+                                    sizeBytes = fileSize,
+                                    localPath = target.absolutePath
+                                )
                             )
-                        )
-                        Log.d(TAG, "Received File via Wi-Fi socket from $resolvedSenderName: $fileName ($fileSize bytes)")
+                        } else {
+                            target.delete()
+                        }
                     }
+
+                    else -> error("Unknown RadioClip wire type")
                 }
+                output.writeByte(ACK_SUCCESS)
+                output.flush()
             } catch (e: Exception) {
-                Log.e(TAG, "Error handling incoming socket connection", e)
+                Log.w(TAG, "Rejected or interrupted Wi-Fi Direct transfer", e)
             }
         }
     }
 
-    override suspend fun send(payload: Payload, targetPeerId: String?): Result<Unit> = withContext(Dispatchers.IO) {
-        runCatching {
-            val destinationIp = when {
-                targetPeerId != null && targetPeerId.contains(".") -> targetPeerId
-                !isGroupOwner && !groupOwnerAddress.isNullOrBlank() -> groupOwnerAddress
-                isGroupOwner && connectedClientIps.isNotEmpty() -> connectedClientIps.first()
-                else -> groupOwnerAddress ?: error("Destination IP unknown. No P2P group formed or client IP recorded.")
+    private fun sendOnce(destinationIp: String, payload: Payload?) {
+        Socket().use { socket ->
+            socket.connect(InetSocketAddress(destinationIp, PORT), SOCKET_TIMEOUT_MS)
+            socket.soTimeout = SOCKET_TIMEOUT_MS
+            val output = DataOutputStream(socket.getOutputStream())
+            val payloadId = payload?.id ?: "__peer_hello__"
+            val timestamp = payload?.timestamp ?: 0L
+            val wireType: Byte = when (payload) {
+                is Payload.Text -> TYPE_TEXT
+                is Payload.File -> TYPE_FILE
+                null -> TYPE_HELLO
             }
-
-            Log.d(TAG, "Connecting TCP socket to $destinationIp:$PORT to send ${payload.javaClass.simpleName}")
-
-            Socket().use { socket ->
-                socket.connect(InetSocketAddress(destinationIp, PORT), SOCKET_TIMEOUT_MS)
-                val output = DataOutputStream(socket.getOutputStream())
-
-                when (payload) {
-                    is Payload.Text -> {
-                        output.writeByte(TYPE_TEXT.toInt())
-                        output.writeUTF(payload.id)
-                        output.writeLong(payload.timestamp)
-                        output.writeUTF(payload.content)
-                        output.flush()
-                    }
-
-                    is Payload.File -> {
-                        output.writeByte(TYPE_FILE.toInt())
-                        output.writeUTF(payload.id)
-                        output.writeLong(payload.timestamp)
-                        output.writeUTF(payload.fileName)
-                        output.writeUTF(payload.mimeType)
-                        output.writeLong(payload.sizeBytes)
-
-                        val inputStream: InputStream? = if (payload.uriString != null) {
-                            context.contentResolver.openInputStream(Uri.parse(payload.uriString))
-                        } else if (payload.localPath != null) {
-                            File(payload.localPath).inputStream()
-                        } else null
-
-                        inputStream?.use { stream ->
-                            val buffer = ByteArray(64 * 1024)
-                            var read: Int
-                            while (stream.read(buffer).also { read = it } != -1) {
-                                output.write(buffer, 0, read)
+            output.writeByte(wireType.toInt())
+            output.writeUTF(payloadId)
+            output.writeLong(timestamp)
+            when (payload) {
+                null -> {
+                    val message = "RadioClip hello v2".toByteArray(Charsets.UTF_8)
+                    val sealed = secureLink.seal(
+                        message, authenticationData(wireType, payloadId, timestamp)
+                    )
+                    output.writeInt(sealed.size)
+                    output.write(sealed)
+                }
+                is Payload.Text -> {
+                    val plaintext = payload.content.toByteArray(Charsets.UTF_8)
+                    require(plaintext.size <= MAX_TEXT_BYTES) { "Text exceeds 1 MB" }
+                    val sealed = secureLink.seal(
+                        plaintext, authenticationData(wireType, payloadId, timestamp)
+                    )
+                    output.writeInt(sealed.size)
+                    output.write(sealed)
+                }
+                is Payload.File -> {
+                    FileTransferSafety.checkSize(payload.sizeBytes)
+                    output.writeUTF(payload.fileName)
+                    output.writeUTF(payload.mimeType)
+                    output.writeLong(payload.sizeBytes)
+                    val inputStream: InputStream? = if (payload.uriString != null) {
+                        context.contentResolver.openInputStream(Uri.parse(payload.uriString))
+                    } else if (payload.localPath != null) {
+                        File(payload.localPath).inputStream()
+                    } else null
+                    (inputStream ?: error("Unable to open selected file")).use { stream ->
+                        var remaining = payload.sizeBytes
+                        var chunkIndex = 0
+                        val buffer = ByteArray(FILE_CHUNK)
+                        do {
+                            val expected = minOf(remaining, FILE_CHUNK.toLong()).toInt()
+                            var readTotal = 0
+                            while (readTotal < expected) {
+                                val count = stream.read(buffer, readTotal, expected - readTotal)
+                                if (count < 0) throw java.io.EOFException("File changed during transfer")
+                                if (count == 0) continue
+                                readTotal += count
                             }
-                        } ?: error("Unable to open stream for file payload: ${payload.fileName}")
-
-                        output.flush()
+                            val sealed = secureLink.seal(
+                                buffer.copyOf(expected),
+                                authenticationData(
+                                    wireType, payloadId, timestamp,
+                                    payload.fileName, payload.mimeType, payload.sizeBytes, chunkIndex
+                                )
+                            )
+                            output.writeInt(sealed.size)
+                            output.write(sealed)
+                            remaining -= expected
+                            chunkIndex++
+                        } while (remaining > 0)
+                        require(stream.read() == -1) { "File size changed during transfer" }
                     }
                 }
-                Log.d(TAG, "Successfully sent payload to $destinationIp")
+            }
+            output.flush()
+            check(DataInputStream(socket.getInputStream()).readUnsignedByte() == ACK_SUCCESS) {
+                "Receiver did not acknowledge this transfer"
+            }
+        }
+    }
+
+    override suspend fun send(payload: Payload, targetPeerId: String?): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                require(secureLink.configured.value) { "Enter a matching pairing phrase first" }
+                require(_state.value == TransportState.CONNECTED) { "Not connected over Wi-Fi Direct" }
+
+                val destinations = when {
+                    targetPeerId != null && targetPeerId.contains(".") -> {
+                        require(!isGroupOwner || connectedClientIps.contains(targetPeerId)) {
+                            "Target peer is not paired"
+                        }
+                        listOf(targetPeerId)
+                    }
+                    !isGroupOwner -> listOfNotNull(groupOwnerAddress)
+                    else -> connectedClientIps.toList()
+                }
+                check(destinations.isNotEmpty()) { "No authenticated Wi-Fi Direct peers" }
+
+                val failed = mutableListOf<String>()
+                for (address in destinations) {
+                    var delivered = false
+                    for (attempt in 0 until 3) {
+                        try {
+                            sendOnce(address, payload)
+                            delivered = true
+                            break
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Wi-Fi peer transfer attempt ${attempt + 1} failed", e)
+                            if (attempt < 2) delay((attempt + 1) * 450L)
+                        }
+                    }
+                    if (!delivered) failed.add(address)
+                }
+                check(failed.isEmpty()) {
+                    "No delivery confirmation from ${failed.joinToString()}"
+                }
                 Unit
             }
         }
-    }
 }

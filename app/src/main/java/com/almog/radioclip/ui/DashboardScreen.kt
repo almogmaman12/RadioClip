@@ -1,6 +1,9 @@
 package com.almog.radioclip.ui
 
 import android.content.Context
+import android.content.ClipData
+import android.content.Intent
+import android.content.ClipboardManager
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -34,10 +37,16 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.text.input.VisualTransformation
+import java.security.SecureRandom
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,6 +78,20 @@ fun DashboardScreen(
     connectedBlePeers: List<PeerDevice>,
     connectedWifiPeers: List<PeerDevice>,
     history: List<Payload>,
+    clipboardSyncEnabled: Boolean,
+    clipboardSyncStatus: String,
+    onClipboardSyncChange: (Boolean) -> Unit,
+    backgroundSyncEnabled: Boolean,
+    onBackgroundSyncChange: (Boolean) -> Unit,
+    onSyncClipboardNow: () -> Unit,
+    pairingConfigured: Boolean,
+    pairingError: String?,
+    transferError: String?,
+    onClearTransferError: () -> Unit,
+    sharedText: String?,
+    onSharedTextConsumed: () -> Unit,
+    onPairingPhrase: (String) -> Unit,
+    onForgetPairing: () -> Unit,
     onConnectPeer: (transportType: TransportType, peerId: String) -> Unit,
     onSendText: (String) -> Unit,
     onSendFile: (name: String, mimeType: String, sizeBytes: Long, uriString: String) -> Unit,
@@ -76,11 +99,27 @@ fun DashboardScreen(
 ) {
     val context = LocalContext.current
     var textInput by remember { mutableStateOf("") }
+    var pairingPhrase by remember { mutableStateOf("") }
+    var revealPairing by remember { mutableStateOf(false) }
+
+    LaunchedEffect(sharedText) {
+        if (!sharedText.isNullOrBlank()) {
+            textInput = sharedText
+            onSharedTextConsumed()
+        }
+    }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    it, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: SecurityException) {
+                // Some document providers cannot persist URI access.
+            }
             val (name, size) = queryFileMeta(context, it)
             val mime = context.contentResolver.getType(it) ?: "application/octet-stream"
             onSendFile(name, mime, size, it.toString())
@@ -146,6 +185,107 @@ fun DashboardScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // Each phone must have the same locally entered passphrase.
+            // Without it, no payloads are accepted or transmitted.
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Secure connection", style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold)
+                        Text(
+                            if (pairingConfigured) "Pairing phrase is configured"
+                            else "Enter the same private phrase on both devices before transferring.",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        OutlinedTextField(
+                            value = pairingPhrase,
+                            onValueChange = { pairingPhrase = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            visualTransformation = if (revealPairing) VisualTransformation.None
+                                else PasswordVisualTransformation(),
+                            label = { Text(if (pairingConfigured) "Change pairing phrase" else "Pairing phrase") },
+                            placeholder = { Text("5+ characters, 12+ recommended") }
+                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Button(
+                                enabled = pairingPhrase.length >= 5,
+                                onClick = {
+                                    onPairingPhrase(pairingPhrase)
+                                    pairingPhrase = ""
+                                    revealPairing = false
+                                }
+                            ) {
+                                Text(if (pairingConfigured) "Update code" else "Save code")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    val letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+                                    val random = SecureRandom()
+                                    pairingPhrase = (1..10)
+                                        .map { letters[random.nextInt(letters.length)] }
+                                        .joinToString("")
+                                    revealPairing = true
+                                }
+                            ) { Text("Generate") }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { revealPairing = !revealPairing }) {
+                                Text(if (revealPairing) "Hide code" else "Show code")
+                            }
+                            if (pairingConfigured) {
+                                TextButton(onClick = onForgetPairing) { Text("Forget saved code") }
+                            }
+                        }
+                        pairingError?.let { error ->
+                            Text(error, color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text(
+                            "Both phones must use exactly the same code. " +
+                                "A 5-character code is convenient but much easier to guess. " +
+                                "Use 12 or more random characters for sensitive transfers.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+
+            if (!transferError.isNullOrBlank()) {
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text("Connection or transfer problem",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onErrorContainer)
+                            Text(transferError,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                style = MaterialTheme.typography.bodySmall)
+                            TextButton(onClick = onClearTransferError) { Text("Dismiss") }
+                        }
+                    }
+                }
+            }
+
             // Transport Status Cards
             item {
                 Row(
@@ -169,11 +309,20 @@ fun DashboardScreen(
                 }
             }
 
-            // Bluetooth Peers Section
+            // Keep connected peers visible when their advertisements become stale.
+            // Nearby results are deduplicated by RadioClip session ID, not MAC.
             item {
+                val allBlePeers = buildList {
+                    addAll(discoveredBlePeers)
+                    connectedBlePeers.forEach { connected ->
+                        if (discoveredBlePeers.none { it.id == connected.id }) {
+                            add(connected)
+                        }
+                    }
+                }
                 PeerSectionCard(
                     title = "Bluetooth Peers (BLE)",
-                    peers = discoveredBlePeers,
+                    peers = allBlePeers,
                     connectedPeers = connectedBlePeers,
                     emptyText = "Scanning for nearby RadioClip BLE devices...",
                     transportType = TransportType.BLE_GATT,
@@ -198,10 +347,82 @@ fun DashboardScreen(
                     title = "Wi-Fi Direct Peers",
                     peers = allWifiPeers,
                     connectedPeers = connectedWifiPeers,
-                    emptyText = "Searching for nearby Android Wi-Fi Direct devices...",
+                    emptyText = "Searching for nearby devices advertising RadioClip.\nInstall and open RadioClip on the other device, and enable Wi-Fi and Location.",
                     transportType = TransportType.WIFI_DIRECT_SOCKET,
                     onConnect = { onConnectPeer(TransportType.WIFI_DIRECT_SOCKET, it) }
                 )
+            }
+
+            // Android restricts background clipboard reads. Require opt-in.
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Auto-sync when RadioClip is open", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    if (clipboardSyncEnabled) "On" else "Off",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            Switch(
+                                checked = clipboardSyncEnabled,
+                                onCheckedChange = onClipboardSyncChange,
+                                enabled = pairingConfigured
+                            )
+                        }
+                        Text(
+                            clipboardSyncStatus,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (clipboardSyncStatus.startsWith("Not delivered") ||
+                                clipboardSyncStatus.startsWith("Unable") ||
+                                clipboardSyncStatus.startsWith("Clipboard access denied")
+                            ) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Background auto-sync (experimental)", fontWeight = FontWeight.SemiBold)
+                                Text("Detects explicit Copy / Cut actions. Briefly displays a focused RadioClip window. Requires Accessibility, overlay and notifications.", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Switch(checked = backgroundSyncEnabled, onCheckedChange = onBackgroundSyncChange, enabled = pairingConfigured)
+                        }
+                        if (backgroundSyncEnabled) {
+                            TextButton(onClick = {
+                                context.startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            }) { Text("Enable RadioClip copy detection") }
+                            TextButton(onClick = {
+                                context.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:" + context.packageName)))
+                            }) { Text("Allow display over other apps") }
+                            TextButton(onClick = {
+                                context.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName))
+                            }) { Text("Check notification permission") }
+                        }
+                        OutlinedButton(
+                            enabled = pairingConfigured,
+                            onClick = onSyncClipboardNow
+                        ) {
+                            Text("Send current clipboard")
+                        }
+                        Text(
+                            "Copy text in another app, return to RadioClip, then tap " +
+                                "Send current clipboard. Auto-sync only works while this app " +
+                                "has focus unless experimental background mode works on your device. For instant sending use Share → RadioClip.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
 
             // Quick Send Clipboard Text Card
@@ -240,7 +461,8 @@ fun DashboardScreen(
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 FilledTonalButton(
-                                    onClick = { filePickerLauncher.launch("*/*") }
+                                    onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                                    enabled = pairingConfigured
                                 ) {
                                     Text("Pick File")
                                 }
@@ -251,7 +473,7 @@ fun DashboardScreen(
                                             textInput = ""
                                         }
                                     },
-                                    enabled = textInput.isNotBlank()
+                                    enabled = pairingConfigured && textInput.isNotBlank()
                                 ) {
                                     Text("Send")
                                 }
@@ -279,7 +501,7 @@ fun DashboardScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            "No synced items yet.\nCopied text or sent files will appear here automatically.",
+                            "No transfers yet.\nConnect a peer, then send text or a file.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.outline
                         )
@@ -357,7 +579,11 @@ fun PeerSectionCard(
                                     style = MaterialTheme.typography.bodyMedium
                                 )
                                 Text(
-                                    text = peer.id,
+                                    text = if (transportType == TransportType.BLE_GATT &&
+                                        peer.id.length == 36
+                                    ) {
+                                        "RadioClip ID: ${peer.id.takeLast(8).uppercase()}"
+                                    } else peer.id,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -369,7 +595,7 @@ fun PeerSectionCard(
                                     shape = RoundedCornerShape(6.dp)
                                 ) {
                                     Text(
-                                        "CONNECTED",
+                                        "LINKED",
                                         color = Color(0xFF2E7D32),
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold,
@@ -498,13 +724,21 @@ fun PayloadItem(payload: Payload) {
                     }
 
                     // Direction badge (Sent vs Received)
-                    val dirColor = if (payload.isOutgoing) Color(0xFF2E7D32) else Color(0xFFE65100)
+                    val dirColor = when {
+                        payload.isFailed -> Color(0xFFD32F2F)
+                        payload.isOutgoing -> Color(0xFF2E7D32)
+                        else -> Color(0xFFE65100)
+                    }
                     Surface(
                         color = dirColor.copy(alpha = 0.15f),
                         shape = RoundedCornerShape(4.dp)
                     ) {
                         Text(
-                            text = if (payload.isOutgoing) "SENT" else "RECEIVED",
+                            text = when {
+                                payload.isFailed -> "FAILED"
+                                payload.isOutgoing -> "SENT"
+                                else -> "RECEIVED"
+                            },
                             color = dirColor,
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
@@ -548,6 +782,19 @@ fun PayloadItem(payload: Payload) {
                         style = MaterialTheme.typography.bodyMedium,
                         fontFamily = FontFamily.Monospace
                     )
+                    if (!payload.isOutgoing) {
+                        OutlinedButton(
+                            onClick = {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                                    as? ClipboardManager
+                                clipboard?.setPrimaryClip(
+                                    ClipData.newPlainText("RadioClip", payload.content)
+                                )
+                            }
+                        ) {
+                            Text("Copy text")
+                        }
+                    }
                 }
                 is Payload.File -> {
                     Row(
@@ -568,7 +815,12 @@ fun PayloadItem(payload: Payload) {
                             )
                         }
 
-                        // Open File action button
+                        if (!payload.isOutgoing && payload.localPath != null) {
+                            OutlinedButton(
+                                onClick = { shareReceivedFile(context, payload) },
+                                shape = RoundedCornerShape(8.dp)
+                            ) { Text("Share") }
+                        }
                         FilledTonalButton(
                             onClick = {
                                 openFileIntent(context, payload)
@@ -581,6 +833,28 @@ fun PayloadItem(payload: Payload) {
                 }
             }
         }
+    }
+}
+
+private fun shareReceivedFile(context: Context, filePayload: Payload.File) {
+    try {
+        val file = filePayload.localPath?.let { java.io.File(it) }
+        if (file == null || !file.isFile) {
+            android.widget.Toast.makeText(context, "File no longer exists", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            context, "${context.packageName}.fileprovider", file
+        )
+        val share = Intent(Intent.ACTION_SEND).apply {
+            type = filePayload.mimeType.ifBlank { "application/octet-stream" }
+            putExtra(Intent.EXTRA_STREAM, uri)
+            clipData = ClipData.newRawUri(filePayload.fileName, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(share, "Save or share received file"))
+    } catch (e: Exception) {
+        android.widget.Toast.makeText(context, "Could not share file: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
     }
 }
 

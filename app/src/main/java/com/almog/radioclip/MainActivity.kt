@@ -15,6 +15,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,12 +34,23 @@ class MainActivity : ComponentActivity() {
 
     private var syncService: RadioSyncService? by mutableStateOf(RadioSyncService.activeInstance)
     private var isBound by mutableStateOf(false)
+    private var pendingFilePayload: Payload.File? = null
+    private var pendingSharedText: String? by mutableStateOf(null)
+    private var pendingNotificationClipboardSend = false
+    private var windowCurrentlyFocused = false
+    private var activityResumed = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as RadioSyncService.LocalBinder
             syncService = binder.getService()
             isBound = true
+            syncService?.setWindowFocused(activityResumed && windowCurrentlyFocused)
+            trySendNotificationClipboard()
+            pendingFilePayload?.let { file ->
+                syncService?.sendPayload(file)
+                pendingFilePayload = null
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -50,25 +64,88 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
-            triggerFilePicker = true
+        handleExternalIntent(intent)
+    }
+
+    private fun handleExternalIntent(intent: Intent?) {
+        if (intent?.action == "ACTION_SYNC_CLIPBOARD_FROM_NOTIFICATION") {
+            pendingNotificationClipboardSend = true
+            trySendNotificationClipboard()
+            return
         }
+        if (intent?.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
+            triggerFilePicker = true
+            return
+        }
+
+        // Sharesheet is the supported way to send from other apps without
+        // bypassing Android's clipboard privacy protections.
+        val shared = when (intent?.action) {
+            Intent.ACTION_SEND -> if (intent.type?.startsWith("text/") == true) {
+                intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+            } else null
+            Intent.ACTION_PROCESS_TEXT ->
+                intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()
+            else -> null
+        } ?: return
+        if (shared.isBlank()) return
+        if (shared.toByteArray(Charsets.UTF_8).size > 1024 * 1024) {
+            android.widget.Toast.makeText(
+                this, "Shared text is too large to send", android.widget.Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        // Fill the compose field so users can choose when and to whom to
+        // transfer their shared clipboard text. Never silently discard it.
+        pendingSharedText = shared
+    }
+
+    private fun trySendNotificationClipboard() {
+        if (pendingNotificationClipboardSend && activityResumed && windowCurrentlyFocused) {
+            val service = syncService ?: return
+            pendingNotificationClipboardSend = false
+            service.syncClipboardNow()
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        windowCurrentlyFocused = hasFocus
+        syncService?.setWindowFocused(activityResumed && hasFocus)
+        trySendNotificationClipboard()
+    }
+
+    override fun onPause() {
+        activityResumed = false
+        syncService?.setWindowFocused(false)
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        activityResumed = true
+        if (windowCurrentlyFocused) syncService?.setWindowFocused(true)
+        trySendNotificationClipboard()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        if (intent?.action == "ACTION_SEND_FILE_FROM_NOTIFICATION") {
-            triggerFilePicker = true
-        }
+        handleExternalIntent(intent)
 
         setContent {
+            // The interface is English-only for now; the system's Hebrew RTL
+            // setting must not reverse its buttons and text layout.
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
             RadioClipTheme {
                 val permissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
                 ) { permissions ->
-                    val allGranted = permissions.values.all { it }
+                    // Notification permission is optional for starting an Android 13+ service.
+                    val allGranted = permissions
+                        .filterKeys { it != Manifest.permission.POST_NOTIFICATIONS }
+                        .values.all { it }
                     if (allGranted) {
                         startAndBindService()
                     }
@@ -76,26 +153,36 @@ class MainActivity : ComponentActivity() {
 
                 // File picker launcher that can be triggered from UI or from notification action
                 val filePickerLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.GetContent()
+                    contract = ActivityResultContracts.OpenDocument()
                 ) { uri: android.net.Uri? ->
                     triggerFilePicker = false
                     uri?.let {
+                        try {
+                            contentResolver.takePersistableUriPermission(
+                                it, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            )
+                        } catch (_: SecurityException) {
+                            // Some document providers do not grant persistence.
+                        }
                         val (name, size) = queryFileMeta(this, it)
                         val mime = contentResolver.getType(it) ?: "application/octet-stream"
-                        syncService?.sendPayload(
-                            Payload.File(
-                                fileName = name,
-                                mimeType = mime,
-                                sizeBytes = size,
-                                uriString = it.toString()
-                            )
+                        val chosenFile = Payload.File(
+                            fileName = name,
+                            mimeType = mime,
+                            sizeBytes = size,
+                            uriString = it.toString()
                         )
+                        if (syncService != null) {
+                            syncService?.sendPayload(chosenFile)
+                        } else {
+                            pendingFilePayload = chosenFile
+                        }
                     }
                 }
 
                 androidx.compose.runtime.LaunchedEffect(triggerFilePicker) {
                     if (triggerFilePicker) {
-                        filePickerLauncher.launch("*/*")
+                        filePickerLauncher.launch(arrayOf("*/*"))
                     }
                 }
 
@@ -126,6 +213,17 @@ class MainActivity : ComponentActivity() {
                 val connectedBlePeers = currentService?.bleEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
                 val connectedWifiPeers = currentService?.wifiEngine?.connectedPeers?.collectAsState()?.value ?: emptyList()
                 val history = currentService?.history?.collectAsState()?.value ?: emptyList()
+                val clipboardSyncEnabled =
+                    currentService?.clipboardSyncEnabled?.collectAsState()?.value ?: false
+                val backgroundSyncEnabled = currentService?.backgroundSyncEnabled?.collectAsState()?.value ?: false
+                val clipboardSyncStatus =
+                    currentService?.clipboardSyncStatus?.collectAsState()?.value ?: "Off"
+                val pairingConfigured =
+                    currentService?.secureLink?.configured?.collectAsState()?.value ?: false
+                val pairingError =
+                    currentService?.pairingError?.collectAsState()?.value
+                val transferError =
+                    currentService?.transferError?.collectAsState()?.value
 
                 DashboardScreen(
                     bleState = bleState,
@@ -135,6 +233,20 @@ class MainActivity : ComponentActivity() {
                     connectedBlePeers = connectedBlePeers,
                     connectedWifiPeers = connectedWifiPeers,
                     history = history,
+                    clipboardSyncEnabled = clipboardSyncEnabled,
+                    clipboardSyncStatus = clipboardSyncStatus,
+                    onClipboardSyncChange = { currentService?.setClipboardSyncEnabled(it) },
+                    backgroundSyncEnabled = backgroundSyncEnabled,
+                    onBackgroundSyncChange = { currentService?.setBackgroundSyncEnabled(it) },
+                    onSyncClipboardNow = { currentService?.syncClipboardNow() },
+                    pairingConfigured = pairingConfigured,
+                    pairingError = pairingError,
+                    transferError = transferError,
+                    onClearTransferError = { currentService?.clearTransferError() },
+                    sharedText = pendingSharedText,
+                    onSharedTextConsumed = { pendingSharedText = null },
+                    onPairingPhrase = { currentService?.setPairingPhrase(it) },
+                    onForgetPairing = { currentService?.forgetPairingPhrase() },
                     onConnectPeer = { transportType, peerId ->
                         currentService?.connectToPeer(transportType, peerId)
                     },
@@ -159,6 +271,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 )
+            }
             }
         }
     }
