@@ -46,7 +46,10 @@ import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.UUID
 import kotlin.coroutines.resume
-import kotlin.coroutines.suspendCoroutine
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 @SuppressLint("MissingPermission")
 class WifiEngine(
@@ -109,6 +112,8 @@ class WifiEngine(
     private var radioClipServiceRequest: WifiP2pDnsSdServiceRequest? = null
     private var discoveryRegistrationInProgress = false
     private var discoveryRetryJob: Job? = null
+    private val connectMutex = Mutex()
+    private var negotiationTimeoutJob: Job? = null
     private val deliveredIds = ConcurrentHashMap<String, Long>()
 
     // MAC address of the peer we initiated connect() to, used for UI ID matching
@@ -151,12 +156,10 @@ class WifiEngine(
 
                     if (networkInfo?.isConnected == true || directP2pInfo?.groupFormed == true) {
                         requestConnectionInfo()
-                    } else {
+                    } else if (_state.value != TransportState.CONNECTING) {
                         closeServerSocket()
                         if (_connectedPeers.value.isNotEmpty()) {
                             _state.value = TransportState.DISCONNECTED
-                        } else if (_state.value == TransportState.CONNECTING) {
-                            _state.value = TransportState.SCANNING
                         }
                         _connectedPeers.value = emptyList()
                         groupOwnerAddress = null
@@ -251,6 +254,8 @@ class WifiEngine(
         connectionMonitorJob = null
         discoveryRetryJob?.cancel()
         discoveryRetryJob = null
+        negotiationTimeoutJob?.cancel()
+        negotiationTimeoutJob = null
 
         if (isReceiverRegistered) {
             try {
@@ -367,7 +372,8 @@ class WifiEngine(
     fun startPeerDiscovery() {
         val p2p = wifiP2pManager ?: return
         val ch = channel ?: return
-        if (_state.value == TransportState.IDLE) return
+        if (_state.value == TransportState.IDLE ||
+            _state.value == TransportState.CONNECTING || _state.value == TransportState.CONNECTED) return
 
         if (radioClipServiceRequest == null) {
             if (discoveryRegistrationInProgress) return
@@ -391,6 +397,8 @@ class WifiEngine(
     }
 
     private fun searchRadioClipServices() {
+        if (_state.value == TransportState.IDLE ||
+            _state.value == TransportState.CONNECTING || _state.value == TransportState.CONNECTED) return
         val p2p = wifiP2pManager ?: return
         val ch = channel ?: return
         refreshVerifiedPeerList()
@@ -419,59 +427,93 @@ class WifiEngine(
         }
     }
 
-    override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.IO) {
-        suspendCoroutine { cont ->
-            val p2p = wifiP2pManager
-            val ch = channel
-            if (p2p == null || ch == null) {
-                cont.resume(Result.failure(IllegalStateException("WifiP2pManager not initialized")))
-                return@suspendCoroutine
-            }
-
-            if (!radioClipSeenAt.containsKey(peerId)) {
-                cont.resume(Result.failure(IllegalArgumentException("This device is not advertising RadioClip")))
-                return@suspendCoroutine
-            }
-            _state.value = TransportState.CONNECTING
-            pendingConnectMac = peerId // Track MAC address for UI peer ID matching
-
-            // Cancel discovery first to let Android Wi-Fi Direct negotiate the P2P group
-            p2p.stopPeerDiscovery(ch, object : WifiP2pManager.ActionListener {
+    // Serialize requests and wait for Android's asynchronous action callbacks.
+    private suspend fun p2pAction(
+        action: (WifiP2pManager.ActionListener) -> Unit
+    ): Int? = withTimeoutOrNull(5000L) {
+        suspendCancellableCoroutine<Int> { cont ->
+            action(object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
-                    initiateGroupConnect(p2p, ch, peerId, cont)
+                    if (cont.isActive) cont.resume(-1)
                 }
 
                 override fun onFailure(reason: Int) {
-                    initiateGroupConnect(p2p, ch, peerId, cont)
+                    if (cont.isActive) cont.resume(reason)
                 }
             })
         }
     }
 
-    private fun initiateGroupConnect(
-        p2p: WifiP2pManager,
-        ch: WifiP2pManager.Channel,
-        peerId: String,
-        cont: kotlin.coroutines.Continuation<Result<Unit>>
-    ) {
-        val config = WifiP2pConfig().apply {
-            this.deviceAddress = peerId
-            // Use standard PBC (Push Button Configuration) for peer-to-peer pairing without PIN
-            wps.setup = android.net.wifi.WpsInfo.PBC
+    override suspend fun connect(peerId: String): Result<Unit> = withContext(Dispatchers.Main) {
+        connectMutex.withLock {
+            val p2p = wifiP2pManager
+            val ch = channel
+            if (p2p == null || ch == null) {
+                return@withLock Result.failure<Unit>(IllegalStateException("WifiP2pManager not initialized"))
+            }
+            if (_state.value == TransportState.CONNECTING || _state.value == TransportState.CONNECTED) {
+                return@withLock Result.failure<Unit>(IllegalStateException("Wi-Fi Direct is already connecting or connected"))
+            }
+            if (!radioClipSeenAt.containsKey(peerId)) {
+                return@withLock Result.failure<Unit>(IllegalArgumentException("This device is not advertising RadioClip"))
+            }
+
+            _state.value = TransportState.CONNECTING
+            pendingConnectMac = peerId
+            val config = WifiP2pConfig().apply {
+                deviceAddress = peerId
+                wps.setup = android.net.wifi.WpsInfo.PBC
+            }
+
+            var failure = "Wi-Fi Direct connection timed out"
+            var accepted = false
+            try {
+                for (attempt in 0 until 4) {
+                    if (_state.value != TransportState.CONNECTING) break
+                    val stopped = p2pAction { p2p.stopPeerDiscovery(ch, it) }
+                    if (stopped != -1) {
+                        failure = "Wi-Fi Direct could not stop discovery (code: ${stopped ?: "timeout"})"
+                        if (stopped != WifiP2pManager.BUSY && stopped != null) break
+                        delay(500L * (attempt + 1))
+                        continue
+                    }
+                    // Allow the framework's discovery-to-negotiation transition to settle.
+                    delay(300L)
+                    if (_state.value != TransportState.CONNECTING) break
+                    val reason = p2pAction { p2p.connect(ch, config, it) }
+                    if (reason == -1) {
+                        accepted = true
+                        negotiationTimeoutJob?.cancel()
+                        negotiationTimeoutJob = scope.launch(Dispatchers.Main) {
+                            delay(35_000L)
+                            if (_state.value == TransportState.CONNECTING && pendingConnectMac == peerId) {
+                                p2pAction { p2p.cancelConnect(ch, it) }
+                                if (_state.value == TransportState.CONNECTING) {
+                                    pendingConnectMac = null
+                                    _state.value = TransportState.SCANNING
+                                    startPeerDiscovery()
+                                }
+                            }
+                        }
+                        return@withLock Result.success(Unit)
+                    }
+                    failure = if (reason == WifiP2pManager.BUSY) {
+                        "Wi-Fi Direct is busy after retrying. Try connecting again."
+                    } else {
+                        "Wi-Fi Direct connect failed (code: ${reason ?: "timeout"})"
+                    }
+                    if (reason != WifiP2pManager.BUSY) break
+                    delay(600L * (attempt + 1))
+                }
+                Result.failure<Unit>(IllegalStateException(failure))
+            } finally {
+                if (!accepted && _state.value == TransportState.CONNECTING) {
+                    pendingConnectMac = null
+                    _state.value = TransportState.SCANNING
+                    startPeerDiscovery()
+                }
+            }
         }
-
-        p2p.connect(ch, config, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Log.d(TAG, "Wi-Fi Direct connect initiation to $peerId succeeded")
-                cont.resume(Result.success(Unit))
-            }
-
-            override fun onFailure(reason: Int) {
-                Log.e(TAG, "Wi-Fi Direct connect initiation to $peerId failed: $reason")
-                _state.value = TransportState.SCANNING
-                cont.resume(Result.failure(Exception("Wi-Fi Direct connect failed code: $reason")))
-            }
-        })
     }
 
     private fun requestConnectionInfo() {
@@ -485,6 +527,8 @@ class WifiEngine(
     }
 
     private fun handleGroupFormed(info: WifiP2pInfo) {
+        negotiationTimeoutJob?.cancel()
+        negotiationTimeoutJob = null
         isGroupOwner = info.isGroupOwner
         val goAddress = info.groupOwnerAddress?.hostAddress
         groupOwnerAddress = goAddress
